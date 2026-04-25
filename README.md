@@ -1,15 +1,17 @@
 # Codex Provider Bridge
 
-将 ChatGPT Web / Codex 登录态桥接为标准 OpenAI 兼容接口，供 OpenClaw、Hermes、Claude Code 等 Agent 使用。
+将 ChatGPT Web / Codex 登录态桥接为尽量兼容 OpenAI 的本地接口，供 OpenClaw、Hermes、Claude Code 等 Agent 使用。
 
 项目会对接 ChatGPT 的 `codex/responses` 通道，并暴露常见的 OpenAI 风格路由：
 
 - `GET /v1/models`
+- `POST /v1/completions`
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
 - `POST /v1/images/generations`
 - `POST /v1/audio/speech`
-- 对应的非 `/v1` 别名：`/responses`、`/chat/completions`、`/images/generations`、`/audio/speech`
+- 对应的非 `/v1` 别名：`/completions`、`/responses`、`/chat/completions`、`/images/generations`、`/audio/speech`
+- 未内置实现的 `/v1/*` 路由：如果配置了 `OPENAI_API_KEY`，会转发到官方 OpenAI API；否则返回 OpenAI 风格 `501` 错误并说明原因
 - `GET /`
 - `GET /health`
 - `GET /routes`
@@ -140,7 +142,7 @@ CHATGPT_EXTRA_MODEL_ALIASES=
 说明：
 
 - `CHATGPT_ACCESS_TOKEN`：如果你已经有 token，填上后可直接启动
-- `OPENAI_API_KEY`：可选；图片和语音都优先走 ChatGPT/Codex 能力，只有对应能力失败或缺 token 时才用它兜底
+- `OPENAI_API_KEY`：可选；图片和语音都优先走 ChatGPT/Codex 能力，只有对应能力失败或缺 token 时才用它兜底；未内置实现的 `/v1/*` 路由也会用它代理到官方 OpenAI API
 - `OPENAI_BASE_URL`：OpenAI API 地址，默认是 `https://api.openai.com`
 - `CHATGPT_ACCOUNT_ID`：可选；默认会从 `~/.codex/auth.json` 读取，realtime 语音握手会带上它
 - `CHATGPT_AUTH_METHOD`：兼容性兜底配置；可选 `prompt | auto | browser | device`
@@ -176,10 +178,20 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 
 ### 文本接口
 
-- `/v1/chat/completions`：支持普通响应和 SSE 流式响应
-- `/v1/responses`：支持非流式 OpenAI Responses 形状，会返回 `output_text`、`output` 和 `usage`
+- `/v1/chat/completions`：支持普通响应和 SSE 流式响应；`messages[].content` 支持字符串，也支持常见 text / image content parts
+- `/v1/responses`：支持非流式和 SSE 流式；非流式会返回 `output_text`、`output` 和 `usage`
+- `/v1/completions`：兼容旧 Completions 形状，会映射成一次 Chat/Responses 文本调用
 - `reasoning_effort` 和 `reasoning.effort` 支持 `low` / `medium` / `high` / `xhigh`，也兼容 `extra high`
+- `response_format={"type":"json_object"}` 和常见 `json_schema` 会被转换成额外 instructions，引导上游返回纯 JSON
 - `/v1/responses` 的 `text.format.type=json_schema` 会被转换成额外 instructions，引导上游返回符合 schema 的纯 JSON
+- 错误响应统一成 OpenAI 风格的 `{ "error": { "message", "type", "param", "code" } }`
+
+尽量兼容但不能完全等价的地方：
+
+- `tool_choice="required"`、指定函数调用、强制 `function_call` 会返回 `501 unsupported_tool_calling`。原因是 ChatGPT/Codex 订阅登录态目前暴露给这个桥的是 Codex responses 通道，不是完整 OpenAI tool_calls/function_call 协议；桥接层不能伪造会被客户端正确执行的工具调用。
+- `n > 1`、`best_of`、`logprobs` 会返回明确错误。原因是上游 Codex responses 通道按 turn 返回单个回答，也不返回 token 级 logprobs。
+- Chat Completions 的音频输出 modality 不走这里；请用 `/v1/audio/speech`。音频输入、转写、翻译等端点如果需要完整 OpenAI 行为，请配置 `OPENAI_API_KEY` 走代理。
+- Assistants、Files、Batches、Vector Stores、Fine-tuning、Embeddings、Moderations 等未内置端点：有 `OPENAI_API_KEY` 时代理到官方 API；没有时返回 `501 unsupported_endpoint` 并说明 ChatGPT/Codex subscription auth 没有向桥接层暴露对应 REST 能力。
 
 `/v1/models` 不再维护写死的主列表，读取顺序是：
 

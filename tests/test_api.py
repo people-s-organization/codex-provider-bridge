@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from bridge import ChatGPTBridge
 from main import app
-from schemas import AudioSpeechRequest, ImageGenerationRequest
+from schemas import AudioSpeechRequest, ChatCompletionRequest, ImageGenerationRequest
 
 
 client = TestClient(app)
@@ -70,6 +70,94 @@ def test_responses_route_returns_openai_like_shape(monkeypatch):
     data = response.json()
     assert data["object"] == "response"
     assert data["output_text"] == '{"summary":"ok"}'
+
+
+def test_responses_stream_route_returns_sse(monkeypatch):
+    async def _fake_responses_stream(request):
+        yield 'event: response.created\ndata: {"type":"response.created"}\n\n'
+        yield 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+        yield 'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+
+    monkeypatch.setattr("main.bridge.responses_stream", _fake_responses_stream)
+
+    response = client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.4-mini", "input": "hello", "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert "event: response.output_text.delta" in response.text
+
+
+def test_chat_content_parts_are_converted_for_codex():
+    bridge = ChatGPTBridge()
+    payload = bridge._build_payload(
+        ChatCompletionRequest(
+            model="gpt-5.5",
+            messages=[
+                {"role": "system", "content": [{"type": "text", "text": "Be terse."}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAA", "detail": "low"},
+                        },
+                    ],
+                },
+            ],
+        )
+    )
+
+    assert payload["instructions"] == "Be terse."
+    assert payload["input"][0]["content"][0] == {"type": "input_text", "text": "What is in this image?"}
+    assert payload["input"][0]["content"][1] == {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,AAA",
+        "detail": "low",
+    }
+
+
+def test_completions_route_returns_legacy_shape(monkeypatch):
+    async def _fake_completion(request):
+        return (
+            {
+                "id": "cmpl_test",
+                "object": "text_completion",
+                "created": 123,
+                "model": request.model,
+                "choices": [{"text": "ok", "index": 0, "logprobs": None, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+            None,
+        )
+
+    monkeypatch.setattr("main.bridge.completion", _fake_completion)
+
+    response = client.post("/v1/completions", json={"model": "gpt-5.5", "prompt": "hello"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "text_completion"
+    assert data["choices"][0]["text"] == "ok"
+
+
+def test_required_tool_choice_reports_openai_error():
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "demo", "parameters": {"type": "object"}}}],
+            "tool_choice": {"type": "function", "function": {"name": "demo"}},
+        },
+    )
+
+    assert response.status_code == 501
+    data = response.json()
+    assert data["error"]["code"] == "unsupported_tool_calling"
+    assert data["error"]["param"] == "tool_choice"
 
 
 def test_image_generation_route_returns_b64_payload(monkeypatch):
@@ -187,3 +275,15 @@ def test_media_routes_report_missing_auth(monkeypatch):
     )
 
     assert response.status_code == 501
+    assert response.json()["error"]["message"].startswith("Media endpoints require auth")
+
+
+def test_unimplemented_v1_route_explains_or_proxies(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+
+    response = client.post("/v1/embeddings", json={"model": "text-embedding-3-small", "input": "hello"})
+
+    assert response.status_code == 501
+    data = response.json()
+    assert data["error"]["code"] == "unsupported_endpoint"
+    assert "Set OPENAI_API_KEY" in data["error"]["message"]

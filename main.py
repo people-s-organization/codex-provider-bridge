@@ -4,11 +4,19 @@ import json
 import socket
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+import httpx
 
 from config import settings
 from model_registry import available_model_ids, available_models, default_model_id
-from schemas import AudioSpeechRequest, ChatCompletionRequest, ImageGenerationRequest, ResponsesRequest
+from schemas import (
+    AudioSpeechRequest,
+    ChatCompletionRequest,
+    CompletionRequest,
+    ImageGenerationRequest,
+    ResponsesRequest,
+)
 from bridge import bridge
 from auth import ensure_authenticated
 
@@ -17,6 +25,89 @@ LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 WILDCARD_HOSTS = {"0.0.0.0", "::", ""}
 ACTIVE_HOST = settings.host
 ACTIVE_PORT = settings.port
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "content-encoding",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+def openai_error_payload(
+    message: str,
+    error_type: str = "invalid_request_error",
+    param: str | None = None,
+    code: str | None = None,
+) -> dict:
+    return {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": param,
+            "code": code,
+        }
+    }
+
+
+def openai_error_response(
+    status_code: int,
+    message: str,
+    error_type: str = "invalid_request_error",
+    param: str | None = None,
+    code: str | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content=openai_error_payload(message, error_type, param, code),
+    )
+
+
+def upstream_error_to_response(error: dict, fallback_status: int = 502) -> JSONResponse:
+    status_code = int(error.get("status") or fallback_status)
+    message = str(error.get("error") or error.get("detail") or "Upstream request failed")
+    detail = error.get("detail")
+    if detail and detail != message:
+        message = f"{message}: {detail}"
+    return openai_error_response(
+        status_code=status_code,
+        message=message,
+        error_type=str(error.get("error_type") or error.get("type") or ("api_error" if status_code >= 500 else "invalid_request_error")),
+        param=error.get("param"),
+        code=error.get("code"),
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return upstream_error_to_response(detail, exc.status_code)
+    return openai_error_response(
+        status_code=exc.status_code,
+        message=str(detail),
+        error_type="api_error" if exc.status_code >= 500 else "invalid_request_error",
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    first_error = exc.errors()[0] if exc.errors() else {}
+    loc = [str(part) for part in first_error.get("loc", []) if part != "body"]
+    param = ".".join(loc) or None
+    return openai_error_response(
+        status_code=422,
+        message=str(first_error.get("msg") or "Invalid request body"),
+        error_type="invalid_request_error",
+        param=param,
+        code="invalid_request",
+    )
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -388,6 +479,8 @@ async def home(request: Request):
 
             <article class="card">
               <h2>Text</h2>
+              <p><code>POST /v1/completions</code></p>
+              <p><code>POST /completions</code></p>
               <p><code>POST /v1/chat/completions</code></p>
               <p><code>POST /chat/completions</code></p>
               <p><code>POST /v1/responses</code></p>
@@ -425,6 +518,7 @@ async def home(request: Request):
                   <label for="endpoint">Endpoint</label>
                   <select id="endpoint" name="endpoint">
                     <option value="chat">Chat Completions</option>
+                    <option value="completions">Completions</option>
                     <option value="responses">Responses</option>
                     <option value="images">Images Generations</option>
                     <option value="audio">Audio Speech</option>
@@ -550,6 +644,18 @@ async def home(request: Request):
               promptLabel: "User Prompt",
               reasoning: true,
               system: true,
+              schema: false,
+              image: false,
+              audio: false,
+              stream: true,
+            }},
+            completions: {{
+              path: "/v1/completions",
+              model: {default_model_json},
+              prompt: "Reply with exactly: bridge ok",
+              promptLabel: "Prompt",
+              reasoning: false,
+              system: false,
               schema: false,
               image: false,
               audio: false,
@@ -702,6 +808,18 @@ async def home(request: Request):
               }}
 
               return {{ path: config.path, responseType: "json", payload }};
+            }}
+
+            if (endpoint === "completions") {{
+              return {{
+                path: config.path,
+                responseType: "json",
+                payload: {{
+                  model,
+                  stream,
+                  prompt: userPrompt,
+                }},
+              }};
             }}
 
             const messages = [];
@@ -934,6 +1052,8 @@ async def routes():
             {"method": "GET", "path": "/routes"},
             {"method": "GET", "path": "/models"},
             {"method": "GET", "path": "/v1/models"},
+            {"method": "POST", "path": "/completions"},
+            {"method": "POST", "path": "/v1/completions"},
             {"method": "POST", "path": "/responses"},
             {"method": "POST", "path": "/v1/responses"},
             {"method": "POST", "path": "/chat/completions"},
@@ -959,6 +1079,7 @@ async def api_index(request: Request):
         },
         "routes": {
             "models": "/v1/models",
+            "completions": "/v1/completions",
             "responses": "/v1/responses",
             "chat_completions": "/v1/chat/completions",
             "images_generations": "/v1/images/generations",
@@ -981,6 +1102,11 @@ async def models_alias():
 @app.post("/responses")
 async def responses_alias(request: ResponsesRequest):
     return await responses(request)
+
+
+@app.post("/completions")
+async def completions_alias(request: CompletionRequest):
+    return await completions(request)
 
 
 @app.post("/chat/completions")
@@ -1009,12 +1135,30 @@ async def list_models():
 @app.post("/v1/responses")
 async def responses(request: ResponsesRequest):
     if request.stream:
-        raise HTTPException(status_code=501, detail="Streaming /v1/responses is not implemented yet")
+        return StreamingResponse(
+            bridge.responses_stream(request),
+            media_type="text/event-stream",
+        )
 
     result, upstream_error = await bridge.responses(request)
     if upstream_error:
-        raise HTTPException(status_code=502, detail=upstream_error)
+        return upstream_error_to_response(upstream_error)
     return result
+
+
+@app.post("/v1/completions")
+async def completions(request: CompletionRequest):
+    if request.stream:
+        return StreamingResponse(
+            bridge.completion_stream(request),
+            media_type="text/event-stream",
+        )
+
+    result, upstream_error = await bridge.completion(request)
+    if upstream_error:
+        return upstream_error_to_response(upstream_error)
+    return result
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
@@ -1026,7 +1170,7 @@ async def chat_completions(request: ChatCompletionRequest):
     else:
         result, upstream_error = await bridge.chat_completion(request)
         if upstream_error:
-            raise HTTPException(status_code=502, detail=upstream_error)
+            return upstream_error_to_response(upstream_error)
         
         return {
             "id": result["id"],
@@ -1039,11 +1183,16 @@ async def chat_completions(request: ChatCompletionRequest):
                     "message": {
                         "role": "assistant",
                         "content": result["content"],
+                        "refusal": None,
+                        "tool_calls": None,
+                        "function_call": None,
                     },
-                    "finish_reason": "stop"
+                    "finish_reason": "stop",
+                    "logprobs": None,
                 }
             ],
-            "usage": result["usage"]
+            "usage": result["usage"],
+            "system_fingerprint": None,
         }
 
 
@@ -1051,7 +1200,7 @@ async def chat_completions(request: ChatCompletionRequest):
 async def image_generations(request: ImageGenerationRequest):
     result, upstream_error = await bridge.image_generation(request)
     if upstream_error:
-        raise HTTPException(status_code=upstream_error.get("status", 502), detail=upstream_error)
+        return upstream_error_to_response(upstream_error)
     return result
 
 
@@ -1059,8 +1208,63 @@ async def image_generations(request: ImageGenerationRequest):
 async def audio_speech(request: AudioSpeechRequest):
     audio_bytes, media_type, upstream_error = await bridge.synthesize_speech(request)
     if upstream_error:
-        raise HTTPException(status_code=upstream_error.get("status", 502), detail=upstream_error)
+        return upstream_error_to_response(upstream_error)
     return Response(content=audio_bytes, media_type=media_type)
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def proxy_or_explain_unimplemented_v1(path: str, request: Request):
+    if not settings.openai_api_key:
+        return openai_error_response(
+            status_code=501,
+            message=(
+                f"/v1/{path} is not implemented by Codex Provider Bridge. "
+                "Reason: ChatGPT/Codex subscription auth does not expose this OpenAI REST "
+                "endpoint to the bridge. Set OPENAI_API_KEY to proxy unimplemented OpenAI "
+                "endpoints through the official OpenAI API."
+            ),
+            error_type="unsupported_endpoint",
+            param=None,
+            code="unsupported_endpoint",
+        )
+
+    outbound_headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != "authorization"
+    }
+    outbound_headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+    outbound_headers.setdefault("User-Agent", "Codex Provider Bridge")
+
+    body = await request.body()
+    target_url = f"{settings.openai_base_url.rstrip('/')}/v1/{path}"
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        response = await client.request(
+            request.method,
+            target_url,
+            params=request.query_params,
+            headers=outbound_headers,
+            content=body or None,
+        )
+
+    response_headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS
+        and key.lower()
+        in {
+            "openai-organization",
+            "openai-processing-ms",
+            "openai-version",
+            "x-request-id",
+        }
+    }
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        media_type=response.headers.get("content-type"),
+        headers=response_headers,
+    )
 
 if __name__ == "__main__":
     args = parse_cli_args()

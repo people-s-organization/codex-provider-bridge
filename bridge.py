@@ -16,7 +16,14 @@ from dotenv import load_dotenv
 
 from config import settings
 from model_registry import resolve_model_name
-from schemas import AudioSpeechRequest, ChatCompletionRequest, ImageGenerationRequest, ResponsesRequest
+from schemas import (
+    AudioSpeechRequest,
+    ChatCompletionRequest,
+    CompletionRequest,
+    ImageGenerationRequest,
+    Message,
+    ResponsesRequest,
+)
 
 
 class ChatGPTBridge:
@@ -97,31 +104,222 @@ class ChatGPTBridge:
 
         return None
 
+    def _stringify_content(self, content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            return str(content)
+
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                text_parts.append(str(part))
+                continue
+
+            part_type = part.get("type")
+            if part_type in {"text", "input_text", "output_text"} and part.get("text") is not None:
+                text_parts.append(str(part["text"]))
+            elif part_type == "refusal" and part.get("refusal") is not None:
+                text_parts.append(str(part["refusal"]))
+            elif part_type in {"image_url", "input_image"}:
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url")
+                image_url = image_url or part.get("url")
+                text_parts.append(f"[image: {image_url or 'attached'}]")
+            elif part_type in {"input_audio", "audio"}:
+                text_parts.append("[audio input omitted: unsupported by the Codex text bridge]")
+            else:
+                text_parts.append(json.dumps(part, ensure_ascii=False))
+
+        return "\n".join(part for part in text_parts if part).strip()
+
+    def _content_to_codex_items(self, content: Any) -> list[dict[str, Any]]:
+        if content is None:
+            return []
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            return [{"type": "input_text", "text": str(content)}]
+
+        items: list[dict[str, Any]] = []
+        for part in content:
+            if isinstance(part, str):
+                items.append({"type": "input_text", "text": part})
+                continue
+            if not isinstance(part, dict):
+                items.append({"type": "input_text", "text": str(part)})
+                continue
+
+            part_type = part.get("type")
+            if part_type in {"text", "input_text", "output_text"} and part.get("text") is not None:
+                item_type = "output_text" if part_type == "output_text" else "input_text"
+                items.append({"type": item_type, "text": str(part["text"])})
+                continue
+            if part_type == "refusal" and part.get("refusal") is not None:
+                items.append({"type": "input_text", "text": str(part["refusal"])})
+                continue
+            if part_type in {"image_url", "input_image"}:
+                image_url = part.get("image_url")
+                detail = part.get("detail")
+                if isinstance(image_url, dict):
+                    detail = detail or image_url.get("detail")
+                    image_url = image_url.get("url")
+                image_url = image_url or part.get("url")
+                if image_url:
+                    item = {"type": "input_image", "image_url": image_url}
+                    if detail:
+                        item["detail"] = detail
+                    items.append(item)
+                continue
+            if part_type in {"input_audio", "audio"}:
+                items.append(
+                    {
+                        "type": "input_text",
+                        "text": "[audio input omitted: unsupported by the Codex text bridge]",
+                    }
+                )
+                continue
+
+            items.append({"type": "input_text", "text": json.dumps(part, ensure_ascii=False)})
+
+        return items or [{"type": "input_text", "text": ""}]
+
+    def _message_to_response_input_item(self, message: Message) -> dict[str, Any] | None:
+        if message.role == "tool":
+            return {
+                "type": "function_call_output",
+                "call_id": message.tool_call_id or f"tool_{uuid.uuid4().hex}",
+                "output": self._stringify_content(message.content),
+            }
+
+        role = "assistant" if message.role == "assistant" else "user"
+        content = self._content_to_codex_items(message.content)
+        if message.tool_calls:
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": (
+                        "[assistant tool_calls omitted: OpenAI tool calling is not exposed "
+                        "by the Codex backend bridge]"
+                    ),
+                }
+            )
+
+        return {"type": "message", "role": role, "content": content}
+
     def _extract_instructions_and_input(self, messages) -> tuple[str | None, list[dict[str, Any]]]:
         instructions = []
         input_items = []
 
         for message in messages:
             if message.role in {"system", "developer"}:
-                if message.content:
-                    instructions.append(message.content)
+                instruction = self._stringify_content(message.content)
+                if instruction:
+                    instructions.append(instruction)
                 continue
 
-            role = "assistant" if message.role == "assistant" else "user"
-            input_items.append(
-                {
-                    "role": role,
-                    "content": [{"type": "input_text", "text": message.content}],
-                }
-            )
+            item = self._message_to_response_input_item(message)
+            if item:
+                input_items.append(item)
 
         compiled_instructions = "\n\n".join(part for part in instructions if part).strip() or None
         return compiled_instructions, input_items
+
+    def _unsupported_tool_choice_error(self, tool_choice: Any, function_call: Any = None) -> dict[str, Any] | None:
+        required_tool = tool_choice == "required" or isinstance(tool_choice, dict)
+        required_function = isinstance(function_call, dict) or function_call not in {None, "none", "auto"}
+        if required_tool or required_function:
+            return {
+                "status": 501,
+                "error": "OpenAI tool calling is not supported by the Codex backend bridge",
+                "type": "unsupported_feature",
+                "param": "tool_choice",
+                "code": "unsupported_tool_calling",
+                "detail": (
+                    "ChatGPT/Codex subscription auth exposes the Codex responses channel, "
+                    "but this bridge cannot faithfully emit OpenAI tool_calls/function_call "
+                    "messages through that channel. Use tool_choice='none'/'auto' without "
+                    "requiring a call, or proxy this request with OPENAI_API_KEY."
+                ),
+            }
+        return None
+
+    def _unsupported_chat_options_error(self, request: ChatCompletionRequest) -> dict[str, Any] | None:
+        if request.n not in {None, 1}:
+            return {
+                "status": 501,
+                "error": "Multiple choices are not supported by the Codex backend bridge",
+                "type": "unsupported_feature",
+                "param": "n",
+                "code": "unsupported_multiple_choices",
+                "detail": "The upstream Codex responses channel returns one assistant answer per turn.",
+            }
+        if request.modalities and any(modality != "text" for modality in request.modalities):
+            return {
+                "status": 501,
+                "error": "Chat Completions audio output is not supported by this bridge",
+                "type": "unsupported_feature",
+                "param": "modalities",
+                "code": "unsupported_chat_audio_output",
+                "detail": "Use /v1/audio/speech for text-to-speech output.",
+            }
+        return self._unsupported_tool_choice_error(request.tool_choice, request.function_call)
+
+    def _unsupported_responses_options_error(self, request: ResponsesRequest) -> dict[str, Any] | None:
+        return self._unsupported_tool_choice_error(request.tool_choice)
+
+    def _augment_instructions_for_chat_response_format(
+        self,
+        instructions: str,
+        response_format: dict[str, Any] | None,
+    ) -> str:
+        if not isinstance(response_format, dict):
+            return instructions
+
+        format_type = response_format.get("type")
+        if format_type == "json_object":
+            return f"{instructions}\n\nReturn only valid JSON with no markdown fences or commentary."
+
+        if format_type == "json_schema":
+            json_schema = response_format.get("json_schema") or {}
+            return self._augment_instructions_for_schema(
+                instructions,
+                {
+                    "type": "json_schema",
+                    "name": json_schema.get("name") or "response",
+                    "schema": json_schema.get("schema") or {},
+                    "strict": json_schema.get("strict", False),
+                },
+            )
+
+        return instructions
 
     def _build_payload(self, request: ChatCompletionRequest) -> dict[str, Any]:
         instructions, input_items = self._extract_instructions_and_input(request.messages)
         if not instructions:
             instructions = "You are a helpful assistant."
+        instructions = self._augment_instructions_for_chat_response_format(
+            instructions,
+            request.response_format,
+        )
+
+        if request.tools or request.functions:
+            instructions = (
+                f"{instructions}\n\n"
+                "Compatibility note: OpenAI tools/functions were supplied, but this bridge "
+                "cannot faithfully emit tool_calls through the Codex backend. Answer directly "
+                "unless the user explicitly asks for a machine-readable tool payload."
+            )
 
         payload: dict[str, Any] = {
             "model": self._resolve_model_name(request.model),
@@ -134,6 +332,9 @@ class ChatGPTBridge:
         reasoning_effort = self._resolve_reasoning_effort(request)
         if reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort}
+        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        if max_output_tokens is not None:
+            payload["max_output_tokens"] = max_output_tokens
 
         return payload
 
@@ -160,21 +361,55 @@ class ChatGPTBridge:
         return f"{base}\n\n{schema_instruction}"
 
     def _build_responses_payload(self, request: ResponsesRequest) -> dict[str, Any]:
+        request_input: Any
+        if isinstance(request.input, str):
+            request_input = [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": request.input}],
+                }
+            ]
+        else:
+            request_input = request.input
+
+        instructions = self._augment_instructions_for_schema(
+            request.instructions,
+            request.text.get("format") if isinstance(request.text, dict) else None,
+        )
+        if request.tools:
+            instructions = (
+                f"{instructions}\n\n"
+                "Compatibility note: tools were supplied, but OpenAI Responses tool-calling "
+                "is not exposed by this bridge when using ChatGPT/Codex subscription auth."
+            )
+
         payload: dict[str, Any] = {
             "model": self._resolve_model_name(request.model),
-            "input": request.input,
+            "input": request_input,
             "stream": True,
             "store": False,
-            "instructions": self._augment_instructions_for_schema(
-                request.instructions,
-                request.text.get("format") if isinstance(request.text, dict) else None,
-            ),
+            "instructions": instructions,
         }
         if request.reasoning and request.reasoning.effort:
             payload["reasoning"] = {"effort": request.reasoning.effort}
         if request.max_output_tokens is not None:
             payload["max_output_tokens"] = request.max_output_tokens
         return payload
+
+    def _usage_from_response(self, response: dict[str, Any]) -> dict[str, int]:
+        raw_usage = response.get("usage") or {}
+        return {
+            "prompt_tokens": raw_usage.get("input_tokens", raw_usage.get("prompt_tokens", 0)),
+            "completion_tokens": raw_usage.get("output_tokens", raw_usage.get("completion_tokens", 0)),
+            "total_tokens": raw_usage.get("total_tokens", 0),
+        }
+
+    def _stream_error_event(self, error: dict[str, Any]) -> dict[str, Any]:
+        event = dict(error)
+        event["error_type"] = error.get("type")
+        event["type"] = "error"
+        return event
 
     async def _codex_event_stream_from_payload(
         self, payload: dict[str, Any]
@@ -220,6 +455,11 @@ class ChatGPTBridge:
     async def _codex_event_stream(
         self, request: ChatCompletionRequest
     ) -> AsyncGenerator[dict[str, Any], None]:
+        unsupported_error = self._unsupported_chat_options_error(request)
+        if unsupported_error:
+            yield self._stream_error_event(unsupported_error)
+            return
+
         async for event in self._codex_event_stream_from_payload(self._build_payload(request)):
             yield event
 
@@ -255,12 +495,7 @@ class ChatGPTBridge:
 
             if event_type == "response.completed":
                 response = event.get("response", {})
-                raw_usage = response.get("usage") or {}
-                usage = {
-                    "prompt_tokens": raw_usage.get("input_tokens", 0),
-                    "completion_tokens": raw_usage.get("output_tokens", 0),
-                    "total_tokens": raw_usage.get("total_tokens", 0),
-                }
+                usage = self._usage_from_response(response)
                 return (
                     {
                         "id": response_id,
@@ -288,6 +523,7 @@ class ChatGPTBridge:
     ) -> AsyncGenerator[str, None]:
         response_id = f"chatcmpl-{uuid.uuid4()}"
         created = int(time.time())
+        include_usage = bool((request.stream_options or {}).get("include_usage"))
 
         async for event in self._codex_event_stream(request):
             event_type = event.get("type")
@@ -324,6 +560,8 @@ class ChatGPTBridge:
                 continue
 
             if event_type == "response.completed":
+                response = event.get("response", {})
+                usage = self._usage_from_response(response)
                 chunk = {
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -338,10 +576,24 @@ class ChatGPTBridge:
                     ],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
+                if include_usage:
+                    usage_chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": request.model,
+                        "choices": [],
+                        "usage": usage,
+                    }
+                    yield f"data: {json.dumps(usage_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
     async def responses(self, request: ResponsesRequest) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        unsupported_error = self._unsupported_responses_options_error(request)
+        if unsupported_error:
+            return None, unsupported_error
+
         response_id = f"resp_{uuid.uuid4().hex}"
         created = int(time.time())
         full_text: list[str] = []
@@ -405,6 +657,164 @@ class ChatGPTBridge:
             },
             None,
         )
+
+    async def responses_stream(self, request: ResponsesRequest) -> AsyncGenerator[str, None]:
+        unsupported_error = self._unsupported_responses_options_error(request)
+        if unsupported_error:
+            event = self._stream_error_event(unsupported_error)
+            yield f"event: error\ndata: {json.dumps(event)}\n\n"
+            return
+
+        async for event in self._codex_event_stream_from_payload(self._build_responses_payload(request)):
+            event_type = event.get("type") or "response.event"
+            if event_type == "error":
+                yield f"event: error\ndata: {json.dumps(event)}\n\n"
+                return
+            yield f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
+
+    def _completion_prompts(self, prompt: Any) -> list[str]:
+        if prompt is None:
+            return [""]
+        if isinstance(prompt, str):
+            return [prompt]
+        if isinstance(prompt, list) and all(isinstance(item, str) for item in prompt):
+            return prompt or [""]
+        return [json.dumps(prompt, ensure_ascii=False)]
+
+    def _completion_to_chat_request(self, request: CompletionRequest, prompt: str) -> ChatCompletionRequest:
+        max_tokens = request.max_tokens
+        return ChatCompletionRequest(
+            model=request.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=request.temperature,
+            top_p=request.top_p,
+            n=1,
+            stream=False,
+            stop=request.stop,
+            max_tokens=max_tokens,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            logit_bias=request.logit_bias,
+            user=request.user,
+        )
+
+    def _unsupported_completion_options_error(self, request: CompletionRequest) -> dict[str, Any] | None:
+        if request.n not in {None, 1}:
+            return {
+                "status": 501,
+                "error": "Multiple legacy completion choices are not supported",
+                "type": "unsupported_feature",
+                "param": "n",
+                "code": "unsupported_multiple_choices",
+                "detail": "The bridge maps legacy /v1/completions to one chat turn per prompt.",
+            }
+        if request.best_of not in {None, 1}:
+            return {
+                "status": 501,
+                "error": "best_of is not supported by the bridge",
+                "type": "unsupported_feature",
+                "param": "best_of",
+                "code": "unsupported_best_of",
+                "detail": "The upstream Codex responses channel does not expose server-side best_of sampling.",
+            }
+        if request.logprobs is not None:
+            return {
+                "status": 501,
+                "error": "logprobs are not supported by the Codex backend bridge",
+                "type": "unsupported_feature",
+                "param": "logprobs",
+                "code": "unsupported_logprobs",
+                "detail": "The upstream Codex responses channel does not return token log probabilities.",
+            }
+        return None
+
+    async def completion(self, request: CompletionRequest) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        unsupported_error = self._unsupported_completion_options_error(request)
+        if unsupported_error:
+            return None, unsupported_error
+
+        completion_id = f"cmpl-{uuid.uuid4()}"
+        created = int(time.time())
+        choices: list[dict[str, Any]] = []
+        total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        for index, prompt in enumerate(self._completion_prompts(request.prompt)):
+            result, error = await self.chat_completion(self._completion_to_chat_request(request, prompt))
+            if error:
+                return None, error
+            text = result["content"] if result else ""
+            if request.echo:
+                text = f"{prompt}{text}"
+            choices.append(
+                {
+                    "text": text,
+                    "index": index,
+                    "logprobs": None,
+                    "finish_reason": "stop",
+                }
+            )
+            usage = (result or {}).get("usage") or {}
+            for key in total_usage:
+                total_usage[key] += usage.get(key, 0)
+
+        return (
+            {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created,
+                "model": request.model,
+                "choices": choices,
+                "usage": total_usage,
+            },
+            None,
+        )
+
+    async def completion_stream(self, request: CompletionRequest) -> AsyncGenerator[str, None]:
+        unsupported_error = self._unsupported_completion_options_error(request)
+        if unsupported_error:
+            yield f"data: {json.dumps({'error': unsupported_error})}\n\n"
+            return
+
+        prompt = self._completion_prompts(request.prompt)[0]
+        chat_request = self._completion_to_chat_request(request, prompt)
+        completion_id = f"cmpl-{uuid.uuid4()}"
+        created = int(time.time())
+
+        async for chunk_line in self.chat_completion_stream(chat_request):
+            if chunk_line.strip() == "data: [DONE]":
+                yield chunk_line
+                return
+            if not chunk_line.startswith("data: "):
+                continue
+            try:
+                chat_chunk = json.loads(chunk_line[6:])
+            except json.JSONDecodeError:
+                continue
+            if "error" in chat_chunk:
+                yield chunk_line
+                return
+
+            choices = chat_chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            text = delta.get("content") or ""
+            finish_reason = choices[0].get("finish_reason")
+            completion_chunk = {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created,
+                "model": request.model,
+                "choices": [
+                    {
+                        "text": text,
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(completion_chunk)}\n\n"
 
     def _missing_openai_api_key_error(self) -> dict[str, Any]:
         return {
