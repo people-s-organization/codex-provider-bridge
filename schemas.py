@@ -65,3 +65,38 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def validate_reasoning_effort(cls, value: Optional[str]) -> Optional[str]:
         return normalize_reasoning_effort(value)
+
+
+class ResponsesRequest(BaseModel):
+    model: str
+    input: List[Dict[str, Any]]
+    stream: Optional[bool] = False
+    store: Optional[bool] = False
+    instructions: Optional[str] = None
+    text: Optional[Dict[str, Any]] = None
+    reasoning: Optional[ReasoningConfig] = None
+    max_output_tokens: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ImageGenerationRequest(BaseModel):
+    model: str = "gpt-image-2"
+    prompt: str
+    n: Optional[int] = 1
+    size: Optional[str] = "1024x1024"
+    quality: Optional[str] = "auto"
+    background: Optional[str] = None
+    output_format: Optional[str] = None
+    response_format: Optional[str] = "b64_json"
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class AudioSpeechRequest(BaseModel):
+    model: str = "gpt-4o-mini-tts"
+    input: str
+    voice: Optional[str] = "marin"
+    instructions: Optional[str] = None
+    response_format: Optional[str] = None
+    format: Optional[str] = "mp3"
+    speed: Optional[float] = 1.0
+    metadata: Optional[Dict[str, Any]] = None

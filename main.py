@@ -1,22 +1,18 @@
 import argparse
 import html
+import json
 import socket
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from config import settings
-from schemas import ChatCompletionRequest
+from model_registry import available_model_ids, available_models, default_model_id
+from schemas import AudioSpeechRequest, ChatCompletionRequest, ImageGenerationRequest, ResponsesRequest
 from bridge import bridge
 from auth import ensure_authenticated
 
 app = FastAPI(title="Codex Provider Bridge")
-AVAILABLE_MODELS = [
-    {"id": "gpt-5.4", "object": "model", "created": 1677610602, "owned_by": "openai"},
-    {"id": "gpt-5.4-mini", "object": "model", "created": 1677610602, "owned_by": "openai"},
-    {"id": "gpt-5.3-codex-spark", "object": "model", "created": 1677610602, "owned_by": "openai"},
-    {"id": "gpt-5.2-codex", "object": "model", "created": 1677610602, "owned_by": "openai"},
-]
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 WILDCARD_HOSTS = {"0.0.0.0", "::", ""}
 ACTIVE_HOST = settings.host
@@ -39,6 +35,7 @@ def resolve_bind_port(host: str, preferred_port: int) -> int:
 
     for port in candidates:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((host, port))
                 return port
@@ -138,14 +135,17 @@ async def home(request: Request):
     agent_base_urls = resolve_agent_base_urls(request)
     escaped_base_url = html.escape(base_url)
     escaped_bind_address = html.escape(bind_address)
+    models = available_models()
+    default_model = default_model_id()
+    default_model_json = json.dumps(default_model).replace("</", "<\\/")
 
     model_links = "".join(
-        f"<li><code>{model['id']}</code></li>"
-        for model in AVAILABLE_MODELS
+        f"<li><code>{html.escape(model['id'])}</code></li>"
+        for model in models
     )
     model_options = "".join(
-        f"<option value=\"{model['id']}\">{model['id']}</option>"
-        for model in AVAILABLE_MODELS
+        f"<option value=\"{html.escape(model['id'], quote=True)}\"></option>"
+        for model in models
     )
     agent_base_link_items = "".join(
         f"<li><a href=\"{html.escape(url.rsplit('/v1', 1)[0], quote=True)}\"><code>{html.escape(url)}</code></a></li>"
@@ -162,13 +162,15 @@ async def home(request: Request):
         <style>
           :root {{
             color-scheme: light dark;
-            --bg: #0b1020;
-            --panel: rgba(255, 255, 255, 0.08);
-            --panel-border: rgba(255, 255, 255, 0.12);
-            --text: #eff6ff;
-            --muted: #b8c4d9;
-            --accent: #7dd3fc;
-            --accent-2: #86efac;
+            --bg: #f6f4ef;
+            --panel: #ffffff;
+            --panel-subtle: #f8fafc;
+            --panel-border: #d7d2c8;
+            --text: #172026;
+            --muted: #64748b;
+            --accent: #0f766e;
+            --accent-2: #9a3412;
+            --danger: #b42318;
           }}
           * {{
             box-sizing: border-box;
@@ -177,43 +179,44 @@ async def home(request: Request):
             margin: 0;
             min-height: 100vh;
             font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            background:
-              radial-gradient(circle at top left, rgba(125, 211, 252, 0.22), transparent 35%),
-              radial-gradient(circle at top right, rgba(134, 239, 172, 0.18), transparent 30%),
-              linear-gradient(160deg, #0b1020 0%, #121a2d 50%, #0f172a 100%);
+            background: var(--bg);
             color: var(--text);
           }}
           .wrap {{
-            max-width: 960px;
+            max-width: 1120px;
             margin: 0 auto;
-            padding: 48px 20px 64px;
+            padding: 32px 20px 56px;
+          }}
+          .header {{
+            border-bottom: 1px solid var(--panel-border);
+            padding-bottom: 20px;
           }}
           h1 {{
-            margin: 0 0 12px;
-            font-size: clamp(2rem, 5vw, 3.3rem);
-            line-height: 1.05;
+            margin: 0 0 10px;
+            font-size: 2rem;
+            line-height: 1.15;
+            letter-spacing: 0;
           }}
           p {{
             color: var(--muted);
-            font-size: 1.02rem;
+            font-size: 0.98rem;
             line-height: 1.6;
           }}
           .grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 16px;
-            margin-top: 28px;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 12px;
+            margin-top: 18px;
           }}
           .card {{
             background: var(--panel);
             border: 1px solid var(--panel-border);
-            border-radius: 18px;
-            padding: 18px;
-            backdrop-filter: blur(10px);
+            border-radius: 8px;
+            padding: 16px;
           }}
           .card h2 {{
-            margin: 0 0 12px;
-            font-size: 1.1rem;
+            margin: 0 0 10px;
+            font-size: 1rem;
           }}
           .card a {{
             color: var(--accent);
@@ -233,35 +236,39 @@ async def home(request: Request):
             color: var(--muted);
           }}
           .hint {{
-            margin-top: 26px;
-            padding: 16px 18px;
-            border-radius: 16px;
-            border: 1px solid rgba(125, 211, 252, 0.24);
-            background: rgba(125, 211, 252, 0.08);
+            margin-top: 18px;
+            padding: 14px 16px;
+            border-radius: 8px;
+            border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--panel-border));
+            background: color-mix(in srgb, var(--accent) 8%, var(--panel));
           }}
           .playground {{
             margin-top: 22px;
-            background: rgba(15, 23, 42, 0.72);
+            background: var(--panel);
           }}
           .playground-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 14px;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 12px;
             margin-top: 14px;
+          }}
+          .full-width {{
+            grid-column: 1 / -1;
           }}
           label {{
             display: block;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             color: var(--muted);
-            font-size: 0.94rem;
+            font-size: 0.9rem;
+            font-weight: 600;
           }}
-          select, textarea, button {{
+          select, input, textarea, button {{
             width: 100%;
-            border-radius: 14px;
-            border: 1px solid rgba(255, 255, 255, 0.16);
-            background: rgba(15, 23, 42, 0.88);
+            border-radius: 8px;
+            border: 1px solid var(--panel-border);
+            background: var(--panel-subtle);
             color: var(--text);
-            padding: 12px 14px;
+            padding: 10px 12px;
             font: inherit;
           }}
           textarea {{
@@ -271,7 +278,9 @@ async def home(request: Request):
           button {{
             cursor: pointer;
             font-weight: 600;
-            background: linear-gradient(135deg, rgba(125, 211, 252, 0.22), rgba(134, 239, 172, 0.22));
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
           }}
           button:disabled {{
             cursor: wait;
@@ -285,14 +294,27 @@ async def home(request: Request):
           }}
           .playground-actions button {{
             width: auto;
-            min-width: 180px;
+            min-width: 160px;
+          }}
+          .inline-field {{
+            align-items: end;
+            display: flex;
+            gap: 10px;
+          }}
+          .inline-field input {{
+            flex: 1;
+          }}
+          .inline-field output {{
+            color: var(--muted);
+            min-width: 44px;
+            text-align: right;
           }}
           .output-panel {{
             margin-top: 16px;
-            padding: 16px;
-            border-radius: 16px;
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            background: rgba(2, 6, 23, 0.62);
+            padding: 14px;
+            border-radius: 8px;
+            border: 1px solid var(--panel-border);
+            background: var(--panel-subtle);
           }}
           .status {{
             margin: 0 0 10px;
@@ -306,16 +328,48 @@ async def home(request: Request):
             color: var(--text);
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
           }}
+          .preview {{
+            display: none;
+            margin-top: 14px;
+          }}
+          .preview img {{
+            image-rendering: pixelated;
+            max-width: 180px;
+            width: 100%;
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            background: repeating-conic-gradient(#e2e8f0 0 25%, #fff 0 50%) 50% / 18px 18px;
+          }}
+          .preview audio {{
+            width: 100%;
+          }}
+          [hidden] {{
+            display: none !important;
+          }}
+          @media (prefers-color-scheme: dark) {{
+            :root {{
+              --bg: #11100e;
+              --panel: #1c1b18;
+              --panel-subtle: #151413;
+              --panel-border: #3f3a34;
+              --text: #f5f2ec;
+              --muted: #b7afa4;
+              --accent: #2dd4bf;
+              --accent-2: #f59e0b;
+              --danger: #f87171;
+            }}
+          }}
         </style>
       </head>
       <body>
         <main class="wrap">
-          <h1>Codex Provider Bridge</h1>
-          <p>
-            This service exposes a small OpenAI-compatible API on top of the
-            ChatGPT/Codex token flow. Use the routes below in your browser or
-            point an agent to the base URL ending in <code>/v1</code>.
-          </p>
+          <header class="header">
+            <h1>Codex Provider Bridge</h1>
+            <p>
+              OpenAI-compatible routes backed by the ChatGPT/Codex response stream.
+              Point agents to a base URL ending in <code>/v1</code>.
+            </p>
+          </header>
 
           <section class="grid">
             <article class="card">
@@ -333,9 +387,19 @@ async def home(request: Request):
             </article>
 
             <article class="card">
-              <h2>Completions</h2>
+              <h2>Text</h2>
               <p><code>POST /v1/chat/completions</code></p>
               <p><code>POST /chat/completions</code></p>
+              <p><code>POST /v1/responses</code></p>
+              <p><code>POST /responses</code></p>
+            </article>
+
+            <article class="card">
+              <h2>Media</h2>
+              <p><code>POST /v1/images/generations</code></p>
+              <p><code>POST /images/generations</code></p>
+              <p><code>POST /v1/audio/speech</code></p>
+              <p><code>POST /audio/speech</code></p>
             </article>
           </section>
 
@@ -352,20 +416,26 @@ async def home(request: Request):
           </section>
 
           <section class="card playground">
-            <h2>Quick Test</h2>
-            <p>
-              Send a browser-side test request to
-              <code>/v1/chat/completions</code>, including selectable reasoning effort,
-              and inspect the response below.
-            </p>
+            <h2>Endpoint Test</h2>
+            <p>Selected route: <code id="endpoint-path">/v1/chat/completions</code></p>
 
             <form id="playground-form">
               <div class="playground-grid">
                 <div>
-                  <label for="model">Model</label>
-                  <select id="model" name="model">{model_options}</select>
+                  <label for="endpoint">Endpoint</label>
+                  <select id="endpoint" name="endpoint">
+                    <option value="chat">Chat Completions</option>
+                    <option value="responses">Responses</option>
+                    <option value="images">Images Generations</option>
+                    <option value="audio">Audio Speech</option>
+                  </select>
                 </div>
                 <div>
+                  <label for="model">Model</label>
+                  <input id="model" name="model" list="available-models" value="{html.escape(default_model, quote=True)}" />
+                  <datalist id="available-models">{model_options}</datalist>
+                </div>
+                <div id="reasoning-field">
                   <label for="reasoning-effort">Reasoning Effort</label>
                   <select id="reasoning-effort" name="reasoning_effort">
                     <option value="low">low</option>
@@ -374,25 +444,72 @@ async def home(request: Request):
                     <option value="extra high">extra high</option>
                   </select>
                 </div>
-                <div>
+                <div id="image-field" hidden>
+                  <label for="image-size">Image Size</label>
+                  <select id="image-size" name="image_size">
+                    <option value="1024x1024">1024x1024</option>
+                    <option value="1024x1536">1024x1536</option>
+                    <option value="1536x1024">1536x1024</option>
+                    <option value="auto">auto</option>
+                  </select>
+                </div>
+                <div id="image-quality-field" hidden>
+                  <label for="image-quality">Image Quality</label>
+                  <select id="image-quality" name="image_quality">
+                    <option value="auto">auto</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                </div>
+                <div id="audio-format-field" hidden>
+                  <label for="audio-format">Audio Format</label>
+                  <select id="audio-format" name="audio_format">
+                    <option value="mp3">mp3</option>
+                    <option value="wav">wav</option>
+                    <option value="aac">aac</option>
+                  </select>
+                </div>
+                <div id="audio-speed-field" hidden>
+                  <label for="audio-speed">Audio Speed</label>
+                  <div class="inline-field">
+                    <input id="audio-speed" name="audio_speed" type="range" min="0.5" max="2" step="0.1" value="1" />
+                    <output id="audio-speed-value" for="audio-speed">1.0x</output>
+                  </div>
+                </div>
+                <div id="system-field" class="full-width">
                   <label for="system-prompt">System Prompt</label>
                   <textarea id="system-prompt" name="system_prompt" placeholder="Optional system prompt">You are a helpful assistant.</textarea>
                 </div>
-              </div>
-
-              <div class="playground-grid">
-                <div style="grid-column: 1 / -1;">
-                  <label for="user-prompt">User Prompt</label>
+                <div id="schema-field" class="full-width" hidden>
+                  <label for="json-schema">JSON Schema</label>
+                  <textarea id="json-schema" name="json_schema">{{
+  "type": "object",
+  "properties": {{
+    "summary": {{"type": "string"}}
+  }},
+  "required": ["summary"],
+  "additionalProperties": false
+}}</textarea>
+                </div>
+                <div class="full-width">
+                  <label for="user-prompt" id="prompt-label">User Prompt</label>
                   <textarea id="user-prompt" name="user_prompt" placeholder="Type a prompt here">Reply with exactly: bridge ok</textarea>
                 </div>
               </div>
 
               <div class="playground-actions">
-                <button id="submit-btn" type="submit">Send Test Request</button>
+                <button id="submit-btn" type="submit">Send Request</button>
                 <button id="stream-btn" type="button">Stream Test</button>
               </div>
             </form>
 
+            <div id="image-preview" class="preview">
+              <img id="image-output" alt="Generated image preview" />
+            </div>
+            <div id="audio-preview" class="preview">
+              <audio id="audio-output" controls></audio>
+            </div>
             <div class="output-panel">
               <p id="result-status" class="status">Ready.</p>
               <pre id="result-body">Submit the form to see the response here.</pre>
@@ -402,21 +519,189 @@ async def home(request: Request):
 
         <script>
           const form = document.getElementById("playground-form");
+          const endpointSelect = document.getElementById("endpoint");
+          const endpointPath = document.getElementById("endpoint-path");
+          const modelInput = document.getElementById("model");
+          const reasoningField = document.getElementById("reasoning-field");
+          const imageField = document.getElementById("image-field");
+          const imageQualityField = document.getElementById("image-quality-field");
+          const audioFormatField = document.getElementById("audio-format-field");
+          const audioSpeedField = document.getElementById("audio-speed-field");
+          const systemField = document.getElementById("system-field");
+          const schemaField = document.getElementById("schema-field");
+          const promptLabel = document.getElementById("prompt-label");
+          const imagePreview = document.getElementById("image-preview");
+          const imageOutput = document.getElementById("image-output");
+          const audioPreview = document.getElementById("audio-preview");
+          const audioOutput = document.getElementById("audio-output");
+          const audioSpeed = document.getElementById("audio-speed");
+          const audioSpeedValue = document.getElementById("audio-speed-value");
           const submitBtn = document.getElementById("submit-btn");
           const streamBtn = document.getElementById("stream-btn");
           const resultStatus = document.getElementById("result-status");
           const resultBody = document.getElementById("result-body");
+          let audioObjectUrl = null;
 
-          function buildPayload(stream) {{
-            const model = document.getElementById("model").value;
+          const endpointConfigs = {{
+            chat: {{
+              path: "/v1/chat/completions",
+              model: {default_model_json},
+              prompt: "Reply with exactly: bridge ok",
+              promptLabel: "User Prompt",
+              reasoning: true,
+              system: true,
+              schema: false,
+              image: false,
+              audio: false,
+              stream: true,
+            }},
+            responses: {{
+              path: "/v1/responses",
+              model: {default_model_json},
+              prompt: "Return a JSON object with a short summary of this bridge.",
+              promptLabel: "Input Text",
+              reasoning: true,
+              system: true,
+              schema: true,
+              image: false,
+              audio: false,
+              stream: false,
+            }},
+            images: {{
+              path: "/v1/images/generations",
+              model: "gpt-image-2",
+              prompt: "A clean product-style diagram of a local API bridge",
+              promptLabel: "Image Prompt",
+              reasoning: false,
+              system: false,
+              schema: false,
+              image: true,
+              audio: false,
+              stream: false,
+            }},
+            audio: {{
+              path: "/v1/audio/speech",
+              model: "gpt-4o-mini-tts",
+              prompt: "Bridge audio test.",
+              promptLabel: "Speech Input",
+              reasoning: false,
+              system: false,
+              schema: false,
+              image: false,
+              audio: true,
+              stream: false,
+            }},
+          }};
+
+          function clearPreview() {{
+            imagePreview.style.display = "none";
+            imageOutput.removeAttribute("src");
+            audioPreview.style.display = "none";
+            audioOutput.removeAttribute("src");
+            if (audioObjectUrl) {{
+              URL.revokeObjectURL(audioObjectUrl);
+              audioObjectUrl = null;
+            }}
+          }}
+
+          function syncEndpoint() {{
+            const config = endpointConfigs[endpointSelect.value];
+            endpointPath.textContent = config.path;
+            modelInput.value = config.model;
+            document.getElementById("user-prompt").value = config.prompt;
+            promptLabel.textContent = config.promptLabel;
+            reasoningField.hidden = !config.reasoning;
+            systemField.hidden = !config.system;
+            schemaField.hidden = !config.schema;
+            imageField.hidden = !config.image;
+            imageQualityField.hidden = !config.image;
+            audioFormatField.hidden = !config.audio;
+            audioSpeedField.hidden = !config.audio;
+            streamBtn.hidden = !config.stream;
+            clearPreview();
+            resultStatus.textContent = "Ready.";
+            resultBody.textContent = "Submit the form to see the response here.";
+          }}
+
+          function buildRequest(stream) {{
+            const endpoint = endpointSelect.value;
+            const config = endpointConfigs[endpoint];
+            const model = modelInput.value.trim() || config.model;
             const reasoningEffort = document.getElementById("reasoning-effort").value;
             const systemPrompt = document.getElementById("system-prompt").value.trim();
             const userPrompt = document.getElementById("user-prompt").value.trim();
 
             if (!userPrompt) {{
-              resultStatus.textContent = "Please enter a user prompt.";
+              resultStatus.textContent = "Please enter a prompt.";
               resultBody.textContent = "";
               return null;
+            }}
+
+            if (endpoint === "images") {{
+              return {{
+                path: config.path,
+                responseType: "json",
+                payload: {{
+                  model,
+                  prompt: userPrompt,
+                  size: document.getElementById("image-size").value,
+                  quality: document.getElementById("image-quality").value,
+                  response_format: "b64_json",
+                }},
+              }};
+            }}
+
+            if (endpoint === "audio") {{
+              return {{
+                path: config.path,
+                responseType: "audio",
+                payload: {{
+                  model,
+                  input: userPrompt,
+                  voice: "marin",
+                  response_format: document.getElementById("audio-format").value,
+                  speed: Number(audioSpeed.value),
+                }},
+              }};
+            }}
+
+            if (endpoint === "responses") {{
+              const payload = {{
+                model,
+                input: [
+                  {{
+                    role: "user",
+                    content: [{{ type: "input_text", text: userPrompt }}],
+                  }},
+                ],
+              }};
+
+              if (systemPrompt) {{
+                payload.instructions = systemPrompt;
+              }}
+              if (reasoningEffort) {{
+                payload.reasoning = {{ effort: reasoningEffort }};
+              }}
+
+              const schemaText = document.getElementById("json-schema").value.trim();
+              if (schemaText) {{
+                try {{
+                  payload.text = {{
+                    format: {{
+                      type: "json_schema",
+                      name: "playground_response",
+                      schema: JSON.parse(schemaText),
+                      strict: true,
+                    }},
+                  }};
+                }} catch (error) {{
+                  resultStatus.textContent = "JSON schema is invalid";
+                  resultBody.textContent = String(error);
+                  return null;
+                }}
+              }}
+
+              return {{ path: config.path, responseType: "json", payload }};
             }}
 
             const messages = [];
@@ -435,7 +720,7 @@ async def home(request: Request):
               payload.reasoning_effort = reasoningEffort;
             }}
 
-            return payload;
+            return {{ path: config.path, responseType: "json", payload }};
           }}
 
           function setBusy(isBusy) {{
@@ -446,25 +731,42 @@ async def home(request: Request):
           async function runJsonTest(event) {{
             event.preventDefault();
 
-            const payload = buildPayload(false);
-            if (!payload) {{
+            const request = buildRequest(false);
+            if (!request) {{
               return;
             }}
 
             setBusy(true);
+            clearPreview();
             resultStatus.textContent = "Sending request...";
-            resultBody.textContent = JSON.stringify(payload, null, 2);
+            resultBody.textContent = JSON.stringify(request.payload, null, 2);
 
             const startedAt = performance.now();
 
             try {{
-              const response = await fetch("/v1/chat/completions", {{
+              const response = await fetch(request.path, {{
                 method: "POST",
                 headers: {{
                   "Content-Type": "application/json",
                 }},
-                body: JSON.stringify(payload),
+                body: JSON.stringify(request.payload),
               }});
+
+              const elapsed = ((performance.now() - startedAt) / 1000).toFixed(2);
+              if (request.responseType === "audio") {{
+                const blob = await response.blob();
+                if (response.ok) {{
+                  audioObjectUrl = URL.createObjectURL(blob);
+                  audioOutput.src = audioObjectUrl;
+                  audioPreview.style.display = "block";
+                }}
+                resultStatus.textContent = `HTTP ${{response.status}} in ${{elapsed}}s`;
+                resultBody.textContent = JSON.stringify({{
+                  content_type: response.headers.get("content-type"),
+                  bytes: blob.size,
+                }}, null, 2);
+                return;
+              }}
 
               const text = await response.text();
               let parsed;
@@ -474,8 +776,11 @@ async def home(request: Request):
                 parsed = text;
               }}
 
-              const elapsed = ((performance.now() - startedAt) / 1000).toFixed(2);
               resultStatus.textContent = `HTTP ${{response.status}} in ${{elapsed}}s`;
+              if (endpointSelect.value === "images" && parsed?.data?.[0]?.b64_json) {{
+                imageOutput.src = `data:image/png;base64,${{parsed.data[0].b64_json}}`;
+                imagePreview.style.display = "block";
+              }}
               resultBody.textContent = typeof parsed === "string"
                 ? parsed
                 : JSON.stringify(parsed, null, 2);
@@ -488,24 +793,25 @@ async def home(request: Request):
           }}
 
           async function runStreamTest() {{
-            const payload = buildPayload(true);
-            if (!payload) {{
+            const request = buildRequest(true);
+            if (!request) {{
               return;
             }}
 
             setBusy(true);
+            clearPreview();
             resultStatus.textContent = "Opening stream...";
             resultBody.textContent = "";
 
             const startedAt = performance.now();
 
             try {{
-              const response = await fetch("/v1/chat/completions", {{
+              const response = await fetch(request.path, {{
                 method: "POST",
                 headers: {{
                   "Content-Type": "application/json",
                 }},
-                body: JSON.stringify(payload),
+                body: JSON.stringify(request.payload),
               }});
 
               if (!response.ok || !response.body) {{
@@ -586,7 +892,12 @@ async def home(request: Request):
           }}
 
           form.addEventListener("submit", runJsonTest);
+          endpointSelect.addEventListener("change", syncEndpoint);
+          audioSpeed.addEventListener("input", () => {{
+            audioSpeedValue.textContent = `${{Number(audioSpeed.value).toFixed(1)}}x`;
+          }});
           streamBtn.addEventListener("click", runStreamTest);
+          syncEndpoint();
         </script>
       </body>
     </html>
@@ -609,7 +920,7 @@ async def health(request: Request):
             "port": resolve_request_port(request),
             "access_urls": access_urls,
         },
-        "models": [model["id"] for model in AVAILABLE_MODELS],
+        "models": available_model_ids(),
     }
 
 
@@ -623,8 +934,14 @@ async def routes():
             {"method": "GET", "path": "/routes"},
             {"method": "GET", "path": "/models"},
             {"method": "GET", "path": "/v1/models"},
+            {"method": "POST", "path": "/responses"},
+            {"method": "POST", "path": "/v1/responses"},
             {"method": "POST", "path": "/chat/completions"},
             {"method": "POST", "path": "/v1/chat/completions"},
+            {"method": "POST", "path": "/images/generations"},
+            {"method": "POST", "path": "/v1/images/generations"},
+            {"method": "POST", "path": "/audio/speech"},
+            {"method": "POST", "path": "/v1/audio/speech"},
         ]
     }
 
@@ -642,7 +959,10 @@ async def api_index(request: Request):
         },
         "routes": {
             "models": "/v1/models",
+            "responses": "/v1/responses",
             "chat_completions": "/v1/chat/completions",
+            "images_generations": "/v1/images/generations",
+            "audio_speech": "/v1/audio/speech",
         },
         "browser_routes": {
             "home": "/",
@@ -658,17 +978,43 @@ async def models_alias():
     return await list_models()
 
 
+@app.post("/responses")
+async def responses_alias(request: ResponsesRequest):
+    return await responses(request)
+
+
 @app.post("/chat/completions")
 async def chat_completions_alias(request: ChatCompletionRequest):
     return await chat_completions(request)
+
+
+@app.post("/images/generations")
+async def image_generations_alias(request: ImageGenerationRequest):
+    return await image_generations(request)
+
+
+@app.post("/audio/speech")
+async def audio_speech_alias(request: AudioSpeechRequest):
+    return await audio_speech(request)
 
 
 @app.get("/v1/models")
 async def list_models():
     return {
         "object": "list",
-        "data": AVAILABLE_MODELS
+        "data": available_models()
     }
+
+
+@app.post("/v1/responses")
+async def responses(request: ResponsesRequest):
+    if request.stream:
+        raise HTTPException(status_code=501, detail="Streaming /v1/responses is not implemented yet")
+
+    result, upstream_error = await bridge.responses(request)
+    if upstream_error:
+        raise HTTPException(status_code=502, detail=upstream_error)
+    return result
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
@@ -699,6 +1045,22 @@ async def chat_completions(request: ChatCompletionRequest):
             ],
             "usage": result["usage"]
         }
+
+
+@app.post("/v1/images/generations")
+async def image_generations(request: ImageGenerationRequest):
+    result, upstream_error = await bridge.image_generation(request)
+    if upstream_error:
+        raise HTTPException(status_code=upstream_error.get("status", 502), detail=upstream_error)
+    return result
+
+
+@app.post("/v1/audio/speech")
+async def audio_speech(request: AudioSpeechRequest):
+    audio_bytes, media_type, upstream_error = await bridge.synthesize_speech(request)
+    if upstream_error:
+        raise HTTPException(status_code=upstream_error.get("status", 502), detail=upstream_error)
+    return Response(content=audio_bytes, media_type=media_type)
 
 if __name__ == "__main__":
     args = parse_cli_args()

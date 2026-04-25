@@ -5,8 +5,11 @@
 项目会对接 ChatGPT 的 `codex/responses` 通道，并暴露常见的 OpenAI 风格路由：
 
 - `GET /v1/models`
+- `POST /v1/responses`
 - `POST /v1/chat/completions`
-- `POST /chat/completions`
+- `POST /v1/images/generations`
+- `POST /v1/audio/speech`
+- 对应的非 `/v1` 别名：`/responses`、`/chat/completions`、`/images/generations`、`/audio/speech`
 - `GET /`
 - `GET /health`
 - `GET /routes`
@@ -116,18 +119,41 @@ cp .env.example .env
 
 ```env
 CHATGPT_ACCESS_TOKEN=
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com
+CHATGPT_ACCOUNT_ID=
 CHATGPT_AUTH_METHOD=prompt
 HOST=0.0.0.0
 PORT=8000
 CHATGPT_BASE_URL=https://chatgpt.com
+CHATGPT_MODELS=
+CHATGPT_EXTRA_MODELS=
+CHATGPT_DEFAULT_MODEL=
+CHATGPT_MEDIA_MODEL=
+CHATGPT_REALTIME_MODEL=
+CHATGPT_MODELS_FILE=~/.codex/models_cache.json
+CHATGPT_CODEX_CONFIG_FILE=~/.codex/config.toml
+CHATGPT_MODEL_ALIASES=
+CHATGPT_EXTRA_MODEL_ALIASES=
 ```
 
 说明：
 
 - `CHATGPT_ACCESS_TOKEN`：如果你已经有 token，填上后可直接启动
+- `OPENAI_API_KEY`：可选；图片和语音都优先走 ChatGPT/Codex 能力，只有对应能力失败或缺 token 时才用它兜底
+- `OPENAI_BASE_URL`：OpenAI API 地址，默认是 `https://api.openai.com`
+- `CHATGPT_ACCOUNT_ID`：可选；默认会从 `~/.codex/auth.json` 读取，realtime 语音握手会带上它
 - `CHATGPT_AUTH_METHOD`：兼容性兜底配置；可选 `prompt | auto | browser | device`
 - `HOST` / `PORT`：服务监听地址
 - `CHATGPT_BASE_URL`：默认是 `https://chatgpt.com`
+- `CHATGPT_MODELS`：显式指定 `/v1/models` 返回的模型列表，支持逗号分隔或 JSON 数组
+- `CHATGPT_EXTRA_MODELS`：在自动模型列表后追加模型，例如刚发布但本地缓存还没刷新的模型
+- `CHATGPT_DEFAULT_MODEL`：首页测试表单默认选中的模型
+- `CHATGPT_MEDIA_MODEL`：图片接口调用 Codex `image_generation` 工具时使用的上游 Responses 模型；默认沿用 `CHATGPT_DEFAULT_MODEL`，再兜底到 `gpt-5.5`
+- `CHATGPT_REALTIME_MODEL`：语音接口调用 realtime WebSocket 时使用的模型，默认 `gpt-realtime-1.5`
+- `CHATGPT_MODELS_FILE`：Codex 模型缓存路径，默认读取 `~/.codex/models_cache.json`
+- `CHATGPT_CODEX_CONFIG_FILE`：Codex 配置路径，默认读取 `~/.codex/config.toml` 中的 `model`
+- `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES`：模型别名映射，支持 JSON 对象或 `old=new,old2=new2`
 
 ## 使用方式
 
@@ -146,6 +172,95 @@ http://<your-host>:<port>/v1
 
 API Key 一般可以随便填一个占位值，是否必须填写取决于你的 Agent 客户端。
 
+## 接口兼容范围
+
+### 文本接口
+
+- `/v1/chat/completions`：支持普通响应和 SSE 流式响应
+- `/v1/responses`：支持非流式 OpenAI Responses 形状，会返回 `output_text`、`output` 和 `usage`
+- `reasoning_effort` 和 `reasoning.effort` 支持 `low` / `medium` / `high` / `xhigh`，也兼容 `extra high`
+- `/v1/responses` 的 `text.format.type=json_schema` 会被转换成额外 instructions，引导上游返回符合 schema 的纯 JSON
+
+`/v1/models` 不再维护写死的主列表，读取顺序是：
+
+1. `CHATGPT_MODELS`
+2. `~/.codex/models_cache.json`
+3. 内置兜底列表
+4. `CHATGPT_EXTRA_MODELS` 追加
+
+默认测试模型读取顺序是：
+
+1. `CHATGPT_DEFAULT_MODEL`
+2. `~/.codex/config.toml` 中的 `model`
+3. 当前模型列表第一个
+
+默认别名仍保留 OpenAI API 客户端常见模型名的兼容映射，也可以通过 `CHATGPT_MODEL_ALIASES` 完全覆盖：
+
+- `gpt-4.1` 会映射到当前默认模型
+- `gpt-4.1-mini` 会映射到当前模型列表里的第一个 `mini` 模型
+
+### 媒体接口
+
+- `/v1/images/generations`：优先使用 ChatGPT/Codex backend 的 Responses `image_generation` 工具，返回 `b64_json`；如果没有 ChatGPT token 但有 `OPENAI_API_KEY`，会兜底代理到 OpenAI Image API
+- `/v1/audio/speech`：优先使用 ChatGPT/Codex bearer 直连 OpenAI realtime WebSocket，收集 `response.output_audio.delta` 后返回真实音频；如果没有 ChatGPT token 但有 `OPENAI_API_KEY`，会兜底代理到 OpenAI Speech API
+- ChatGPT realtime 输出原生是 24 kHz PCM；`wav` / `pcm` 可直接返回，`mp3` / `aac` / `flac` / `opus` 需要本机 `ffmpeg`
+- 如果缺少对应真实上游凭据，媒体接口会返回 `501`，不会返回假图片或假音频
+
+## 请求示例
+
+Chat Completions：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "Reply with exactly: bridge ok"}],
+    "reasoning_effort": "medium"
+  }'
+```
+
+Responses + JSON Schema：
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.5",
+    "input": [{"role": "user", "content": [{"type": "input_text", "text": "summarize this bridge"}]}],
+    "text": {
+      "format": {
+        "type": "json_schema",
+        "name": "summary",
+        "schema": {
+          "type": "object",
+          "properties": {"summary": {"type": "string"}},
+          "required": ["summary"],
+          "additionalProperties": false
+        },
+        "strict": true
+      }
+    }
+  }'
+```
+
+图片生成接口：
+
+```bash
+curl http://127.0.0.1:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-image-2","prompt":"a bridge diagram","size":"1024x1024","quality":"auto","response_format":"b64_json"}'
+```
+
+音频生成接口：
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -o speech.wav \
+  -d '{"model":"gpt-4o-mini-tts","input":"bridge audio test","voice":"marin","response_format":"wav"}'
+```
+
 ## 调试接口
 
 - `/`：首页和测试表单
@@ -156,9 +271,11 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 
 首页内置：
 
-- 普通请求测试表单
-- 流式响应测试
+- 可切换的 `chat/completions`、`responses`、`images/generations`、`audio/speech` 测试表单
+- Chat Completions 流式响应测试
 - reasoning effort 选择（`low` / `medium` / `high` / `extra high`）
+- Responses JSON Schema 测试输入
+- 图片和音频响应预览
 
 ## Docker 说明
 
