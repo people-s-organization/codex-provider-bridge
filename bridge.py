@@ -411,6 +411,32 @@ class ChatGPTBridge:
         event["type"] = "error"
         return event
 
+    def _chat_stream_chunk(
+        self,
+        response_id: str,
+        created: int,
+        model: str,
+        delta: dict[str, Any],
+        finish_reason: str | None = None,
+        include_usage: bool = False,
+    ) -> dict[str, Any]:
+        chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+        if include_usage:
+            chunk["usage"] = None
+        return chunk
+
     async def _codex_event_stream_from_payload(
         self, payload: dict[str, Any]
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -524,18 +550,28 @@ class ChatGPTBridge:
         response_id = f"chatcmpl-{uuid.uuid4()}"
         created = int(time.time())
         include_usage = bool((request.stream_options or {}).get("include_usage"))
+        sent_role = False
 
         async for event in self._codex_event_stream(request):
             event_type = event.get("type")
 
             if event_type == "error":
-                yield f"data: {json.dumps(event)}\n\n"
+                yield f"data: {json.dumps({'error': event})}\n\n"
                 return
 
             if event_type == "response.created":
                 response = event.get("response", {})
                 response_id = response.get("id", response_id)
                 created = response.get("created_at", created)
+                chunk = self._chat_stream_chunk(
+                    response_id=response_id,
+                    created=created,
+                    model=request.model,
+                    delta={"role": "assistant"},
+                    include_usage=include_usage,
+                )
+                yield f"data: {json.dumps(chunk)}\n\n"
+                sent_role = True
                 continue
 
             if event_type == "response.output_text.delta":
@@ -543,38 +579,47 @@ class ChatGPTBridge:
                 if not delta:
                     continue
 
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": delta},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+                if not sent_role:
+                    role_chunk = self._chat_stream_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=request.model,
+                        delta={"role": "assistant"},
+                        include_usage=include_usage,
+                    )
+                    yield f"data: {json.dumps(role_chunk)}\n\n"
+                    sent_role = True
+
+                chunk = self._chat_stream_chunk(
+                    response_id=response_id,
+                    created=created,
+                    model=request.model,
+                    delta={"content": delta},
+                    include_usage=include_usage,
+                )
                 yield f"data: {json.dumps(chunk)}\n\n"
                 continue
 
             if event_type == "response.completed":
                 response = event.get("response", {})
                 usage = self._usage_from_response(response)
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
+                if not sent_role:
+                    role_chunk = self._chat_stream_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=request.model,
+                        delta={"role": "assistant"},
+                        include_usage=include_usage,
+                    )
+                    yield f"data: {json.dumps(role_chunk)}\n\n"
+                chunk = self._chat_stream_chunk(
+                    response_id=response_id,
+                    created=created,
+                    model=request.model,
+                    delta={},
+                    finish_reason="stop",
+                    include_usage=include_usage,
+                )
                 yield f"data: {json.dumps(chunk)}\n\n"
                 if include_usage:
                     usage_chunk = {
@@ -800,6 +845,8 @@ class ChatGPTBridge:
             delta = choices[0].get("delta") or {}
             text = delta.get("content") or ""
             finish_reason = choices[0].get("finish_reason")
+            if not text and finish_reason is None:
+                continue
             completion_chunk = {
                 "id": completion_id,
                 "object": "text_completion",

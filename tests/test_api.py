@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from fastapi.testclient import TestClient
 
@@ -8,6 +9,10 @@ from schemas import AudioSpeechRequest, ChatCompletionRequest, ImageGenerationRe
 
 
 client = TestClient(app)
+
+
+def _sse_data_lines(text):
+    return [line.removeprefix("data: ") for line in text.splitlines() if line.startswith("data: ")]
 
 
 def test_models_route_exists():
@@ -89,6 +94,53 @@ def test_responses_stream_route_returns_sse(monkeypatch):
     assert "event: response.output_text.delta" in response.text
 
 
+def test_chat_completions_stream_returns_openai_chunks(monkeypatch):
+    async def _fake_codex_event_stream(request):
+        yield {"type": "response.created", "response": {"id": "chatcmpl_test", "created_at": 123}}
+        yield {"type": "response.output_text.delta", "delta": "Hel"}
+        yield {"type": "response.output_text.delta", "delta": "lo"}
+        yield {
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 3,
+                }
+            },
+        }
+
+    monkeypatch.setattr("main.bridge._codex_event_stream", _fake_codex_event_stream)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+
+    assert response.status_code == 200
+    data_lines = _sse_data_lines(response.text)
+    assert data_lines[-1] == "[DONE]"
+
+    chunks = [json.loads(line) for line in data_lines[:-1]]
+    assert chunks[0]["object"] == "chat.completion.chunk"
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert chunks[0]["usage"] is None
+    assert [chunk["choices"][0]["delta"].get("content") for chunk in chunks[1:3]] == ["Hel", "lo"]
+    assert chunks[3]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[3]["usage"] is None
+    assert chunks[4]["choices"] == []
+    assert chunks[4]["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+    }
+
+
 def test_chat_content_parts_are_converted_for_codex():
     bridge = ChatGPTBridge()
     payload = bridge._build_payload(
@@ -141,6 +193,27 @@ def test_completions_route_returns_legacy_shape(monkeypatch):
     data = response.json()
     assert data["object"] == "text_completion"
     assert data["choices"][0]["text"] == "ok"
+
+
+def test_completions_stream_skips_chat_role_chunk(monkeypatch):
+    async def _fake_codex_event_stream(request):
+        yield {"type": "response.created", "response": {"id": "chatcmpl_test", "created_at": 123}}
+        yield {"type": "response.output_text.delta", "delta": "ok"}
+        yield {"type": "response.completed", "response": {"usage": {}}}
+
+    monkeypatch.setattr("main.bridge._codex_event_stream", _fake_codex_event_stream)
+
+    response = client.post(
+        "/v1/completions",
+        json={"model": "gpt-5.5", "prompt": "hello", "stream": True},
+    )
+
+    assert response.status_code == 200
+    data_lines = _sse_data_lines(response.text)
+    assert data_lines[-1] == "[DONE]"
+    chunks = [json.loads(line) for line in data_lines[:-1]]
+    assert chunks[0]["choices"][0]["text"] == "ok"
+    assert chunks[1]["choices"][0]["finish_reason"] == "stop"
 
 
 def test_required_tool_choice_reports_openai_error():

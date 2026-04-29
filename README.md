@@ -232,6 +232,19 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+Chat Completions 流式：
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "Count to three."}],
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }'
+```
+
 Responses + JSON Schema：
 
 ```bash
