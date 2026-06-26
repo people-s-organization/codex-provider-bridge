@@ -1,0 +1,41 @@
+{
+  "name": "Codex Provider Bridge",
+  "status": "beta",
+  "accent": {
+    "from": "#38bdf8",
+    "to": "#14b8a6"
+  },
+  "platform": {
+    "en": "Local HTTP API",
+    "zh": "本地 HTTP API"
+  },
+  "tagline": {
+    "en": "Bridge ChatGPT and Codex auth into OpenAI-compatible local endpoints.",
+    "zh": "把 ChatGPT 和 Codex 登录态桥接成本地 OpenAI 兼容接口。"
+  },
+  "description": {
+    "en": "Codex Provider Bridge exposes local OpenAI-style routes for agent tools, using ChatGPT Web or Codex authentication where available and falling back to the official OpenAI API for unsupported endpoints when configured.",
+    "zh": "Codex Provider Bridge 为 Agent 工具提供本地 OpenAI 风格接口，可使用 ChatGPT Web 或 Codex 登录态，并在已配置时把未内置支持的端点转发到官方 OpenAI API。"
+  },
+  "features": {
+    "en": [
+      "Serves OpenAI-style models, responses, chat completions, image generation, and speech endpoints.",
+      "Supports token, Codex auth file, browser login, and device-code authentication flows.",
+      "Provides local health, route discovery, model aliasing, and configurable fallback behavior."
+    ],
+    "zh": [
+      "提供 OpenAI 风格的模型、Responses、Chat Completions、图片生成和语音端点。",
+      "支持 token、Codex auth 文件、浏览器登录和 device-code 登录流程。",
+      "内置本地健康检查、路由发现、模型别名和可配置的兜底转发行为。"
+    ]
+  },
+  "links": [
+    {
+      "label": {
+        "en": "GitHub",
+        "zh": "GitHub"
+      },
+      "href": "https://github.com/people-s-organization/codex-provider-bridge"
+    }
+  ]
+}
