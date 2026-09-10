@@ -61,19 +61,78 @@ def test_assistant_content_parts_are_retyped_by_role():
     ]
 
 
-def test_assistant_tool_calls_note_is_output_text():
+def test_assistant_tool_calls_are_replayed_as_function_calls():
     payload = _chat_payload(
         [
-            {"role": "user", "content": "hello"},
+            {"role": "user", "content": "weather in Paris?"},
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{"id": "call_1", "type": "function"}],
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
+                    }
+                ],
             },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "18C"},
+            {"role": "user", "content": "Reply with one word: the temperature."},
         ]
     )
 
-    assert [part["type"] for part in _parts(payload, 1)] == ["output_text"]
+    assert payload["input"][1] == {
+        "type": "function_call",
+        "call_id": "call_abc",
+        "name": "get_weather",
+        "arguments": '{"city":"Paris"}',
+    }
+    assert payload["input"][2] == {
+        "type": "function_call_output",
+        "call_id": "call_abc",
+        "output": "18C",
+    }
+
+
+def test_tool_call_without_id_is_not_replayed():
+    payload = _chat_payload(
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": None, "tool_calls": [{"type": "function"}]},
+        ]
+    )
+
+    assert payload["input"][1]["type"] == "message"
+    assert payload["input"][1]["content"][0]["type"] == "output_text"
+    assert "tool_calls omitted" in payload["input"][1]["content"][0]["text"]
+
+
+def test_unpaired_tool_result_degrades_to_user_text():
+    payload = _chat_payload(
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "tool", "tool_call_id": "call_missing", "content": "42"},
+        ]
+    )
+
+    assert payload["input"][1]["type"] == "message"
+    assert payload["input"][1]["role"] == "user"
+    part = payload["input"][1]["content"][0]
+    assert part["type"] == "input_text"
+    assert "call_id=call_missing" in part["text"]
+    assert "42" in part["text"]
+
+
+def test_tool_result_without_call_id_degrades_to_user_text():
+    payload = _chat_payload(
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "tool", "content": "42"},
+        ]
+    )
+
+    assert payload["input"][1]["type"] == "message"
+    assert "unknown call_id" in payload["input"][1]["content"][0]["text"]
 
 
 def test_image_parts_are_only_valid_for_user_turns():
@@ -123,7 +182,27 @@ def test_responses_input_items_are_normalized_per_role():
 
     assert payload["input"][0]["content"] == [{"type": "input_text", "text": "hi"}]
     assert payload["input"][1]["content"] == [{"type": "output_text", "text": "hello"}]
-    assert payload["input"][2] == {"type": "function_call_output", "call_id": "call_1", "output": "42"}
+    assert payload["input"][2]["type"] == "message"
+    assert "call_id=call_1" in payload["input"][2]["content"][0]["text"]
+
+
+def test_responses_paired_tool_items_pass_through():
+    bridge = ChatGPTBridge()
+    call = {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{}"}
+    output = {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+    payload = bridge._build_responses_payload(
+        ResponsesRequest(
+            model="gpt-fixture-a",
+            input=[
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                call,
+                output,
+            ],
+        )
+    )
+
+    assert payload["input"][1] == call
+    assert payload["input"][2] == output
 
 
 def test_responses_string_input_stays_a_user_message():

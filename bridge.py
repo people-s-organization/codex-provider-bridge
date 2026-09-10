@@ -228,21 +228,45 @@ class ChatGPTBridge:
         return items or [{"type": text_type, "text": ""}]
 
     def _normalize_responses_input_items(self, request_input: Any) -> Any:
-        """Fix role/content part types on client-supplied ``/v1/responses`` input.
+        """Fix content part types and drop unpaired tool outputs on ``/v1/responses`` input.
 
-        Clients normally send ``input_text`` for every message, which the Codex backend
-        rejects as soon as an assistant turn is present. Message items are rewritten
-        with the same role rules as the chat completions path; every other item type is
-        passed through untouched.
+        Two upstream rules are enforced here:
+
+        * message content is retyped per role (assistant turns only accept ``output_text``
+          / ``refusal``, user turns only accept ``input_text`` / ``input_image``);
+        * a ``function_call_output`` is only sent when a ``function_call`` with the same
+          ``call_id`` appeared earlier in the same input, because the backend rejects an
+          orphan output with ``No tool call found for function call output``.
+
+        Unpaired outputs degrade to a plain user text turn; other item types pass through
+        untouched.
         """
 
         if not isinstance(request_input, list):
             return request_input
 
         normalized: list[Any] = []
+        known_call_ids: set[str] = set()
+
         for item in request_input:
             if not isinstance(item, dict):
                 normalized.append(item)
+                continue
+
+            item_type = str(item.get("type") or "").strip()
+            if item_type == "function_call":
+                call_id = str(item.get("call_id") or item.get("id") or "").strip()
+                if call_id:
+                    known_call_ids.add(call_id)
+                normalized.append(item)
+                continue
+
+            if item_type == "function_call_output":
+                call_id = str(item.get("call_id") or "").strip()
+                if call_id and call_id in known_call_ids:
+                    normalized.append(item)
+                else:
+                    normalized.append(self._tool_result_message(item.get("output"), call_id))
                 continue
 
             role = str(item.get("role") or "").strip().lower()
@@ -260,32 +284,104 @@ class ChatGPTBridge:
 
         return normalized
 
-    def _message_to_response_input_item(self, message: Message) -> dict[str, Any] | None:
-        if message.role == "tool":
-            return {
-                "type": "function_call_output",
-                "call_id": message.tool_call_id or f"tool_{uuid.uuid4().hex}",
-                "output": self._stringify_content(message.content),
-            }
+    def _tool_result_message(self, output: Any, call_id: str) -> dict[str, Any]:
+        """Render a tool result the upstream will accept even without its call."""
 
-        role = "assistant" if message.role == "assistant" else "user"
-        content = self._content_to_codex_items(message.content, role)
-        if message.tool_calls:
-            content.append(
+        text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+        text = (text or "").strip() or "(tool returned no output)"
+        label = f"call_id={call_id}" if call_id else "unknown call_id"
+        return {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": f"[tool result ({label})]\n{text}"}],
+        }
+
+    def _assistant_tool_call_items(self, tool_calls: Any) -> list[dict[str, Any]]:
+        """Rebuild Responses ``function_call`` items from OpenAI ``tool_calls``.
+
+        Replaying the call is what makes the later ``function_call_output`` valid; the
+        Codex backend accepts the pair (verified) but rejects the output on its own.
+        Calls without an id cannot be paired, so they are not emitted.
+        """
+
+        if not isinstance(tool_calls, list):
+            return []
+
+        items: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+
+            call_id = str(tool_call.get("id") or tool_call.get("call_id") or "").strip()
+            if not call_id:
+                continue
+
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                function = {}
+
+            name = str(function.get("name") or tool_call.get("name") or "").strip() or "unknown_function"
+            arguments = function.get("arguments", tool_call.get("arguments"))
+            if isinstance(arguments, (dict, list)):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+
+            items.append(
                 {
-                    "type": "output_text" if role == "assistant" else "input_text",
-                    "text": (
-                        "[assistant tool_calls omitted: OpenAI tool calling is not exposed "
-                        "by the Codex backend bridge]"
-                    ),
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments if isinstance(arguments, str) else "",
                 }
             )
 
-        return {"type": "message", "role": role, "content": content}
+        return items
+
+    def _message_to_response_input_items(
+        self, message: Message, known_call_ids: set[str]
+    ) -> list[dict[str, Any]]:
+        if message.role == "tool":
+            output = self._stringify_content(message.content)
+            call_id = str(message.tool_call_id or "").strip()
+            if call_id and call_id in known_call_ids:
+                return [
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output or "(tool returned no output)",
+                    }
+                ]
+            return [self._tool_result_message(output, call_id)]
+
+        role = "assistant" if message.role == "assistant" else "user"
+        content = self._content_to_codex_items(message.content, role)
+        items: list[dict[str, Any]] = []
+
+        if role == "assistant" and message.tool_calls:
+            call_items = self._assistant_tool_call_items(message.tool_calls)
+            if not call_items:
+                content.append(
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "[assistant tool_calls omitted: OpenAI tool calling is not exposed "
+                            "by the Codex backend bridge]"
+                        ),
+                    }
+                )
+            if content:
+                items.append({"type": "message", "role": role, "content": content})
+            items.extend(call_items)
+            known_call_ids.update(item["call_id"] for item in call_items)
+            return items
+
+        if content:
+            items.append({"type": "message", "role": role, "content": content})
+        return items
 
     def _extract_instructions_and_input(self, messages) -> tuple[str | None, list[dict[str, Any]]]:
         instructions = []
-        input_items = []
+        input_items: list[dict[str, Any]] = []
+        known_call_ids: set[str] = set()
 
         for message in messages:
             if message.role in {"system", "developer"}:
@@ -294,9 +390,7 @@ class ChatGPTBridge:
                     instructions.append(instruction)
                 continue
 
-            item = self._message_to_response_input_item(message)
-            if item:
-                input_items.append(item)
+            input_items.extend(self._message_to_response_input_items(message, known_call_ids))
 
         compiled_instructions = "\n\n".join(part for part in instructions if part).strip() or None
         return compiled_instructions, input_items

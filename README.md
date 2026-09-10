@@ -189,11 +189,12 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 - `response_format={"type":"json_object"}` 和常见 `json_schema` 会被转换成额外 instructions，引导上游返回纯 JSON
 - `/v1/responses` 的 `text.format.type=json_schema` 会被转换成额外 instructions，引导上游返回符合 schema 的纯 JSON
 - 多轮对话的 content part 会按角色重新定型：assistant 轮次只发 `output_text` / `refusal`，user 轮次只发 `input_text` / `input_image`。上游对 assistant 轮次收到 `input_text` 会整包报 `Invalid value: 'input_text'`，所以 `/v1/responses` 的 `input` 里客户端自己传的 message item 也会做同样归一化（其他 item 类型原样透传）
+- 历史里的工具调用会被重建成上游格式：assistant 的 `tool_calls` → `function_call`，`role:"tool"` 的结果按 `tool_call_id` 配成 `function_call_output`。上游只接受成对出现的 `function_call` / `function_call_output`，配不上的（缺 id、或上文没有对应 call）会降级成一条 user 文本，避免整包报 `No tool call found for function call output`；`/v1/responses` 里客户端自己传的孤儿 `function_call_output` 同样降级
 - 错误响应统一成 OpenAI 风格的 `{ "error": { "message", "type", "param", "code" } }`
 
 尽量兼容但不能完全等价的地方：
 
-- `tool_choice="required"`、指定函数调用、强制 `function_call` 会返回 `501 unsupported_tool_calling`。原因是 ChatGPT/Codex 订阅登录态目前暴露给这个桥的是 Codex responses 通道，不是完整 OpenAI tool_calls/function_call 协议；桥接层不能伪造会被客户端正确执行的工具调用。
+- `tool_choice="required"`、指定函数调用、强制 `function_call` 会返回 `501 unsupported_tool_calling`。原因是 ChatGPT/Codex 订阅登录态目前暴露给这个桥的是 Codex responses 通道，不是完整 OpenAI tool_calls/function_call 协议；桥接层不能伪造会被客户端正确执行的工具调用。注意这只限制"让上游发起工具调用"：客户端自己历史里的工具调用与结果会被重建并透传（见上）。
 - `n > 1`、`best_of`、`logprobs` 会返回明确错误。原因是上游 Codex responses 通道按 turn 返回单个回答，也不返回 token 级 logprobs。
 - `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 不转发给上游：实测 Codex responses 通道对这四个参数一律返回 `400 Unsupported parameter`，因此桥接层直接忽略输出上限（传了不会报错，但也不会生效）。
 - Chat Completions 的音频输出 modality 不走这里；请用 `/v1/audio/speech`。音频输入、转写、翻译等端点如果需要完整 OpenAI 行为，请配置 `OPENAI_API_KEY` 走代理。
