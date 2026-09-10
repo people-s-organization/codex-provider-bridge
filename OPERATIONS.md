@@ -43,7 +43,7 @@ of schema validity. `store` for chat completions is ignored with a warning becau
 API exposes no retrieval route for them.
 
 Explicit options the subscription endpoint cannot honor produce
-`X-Bridge-Warnings`. Set `BRIDGE_STRICT_COMPATIBILITY=true` to reject instead.
+`X-Bridge-Compatibility-Warnings`. Set `BRIDGE_STRICT_COMPATIBILITY=true` to reject instead.
 No character clipping is presented as a token budget.
 
 ## Upstream transport

@@ -224,7 +224,7 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 - ✅ **函数工具调用（function tool calling）**：`tools` / 旧版 `functions` 会转发给上游，上游流式返回的 `function_call` 会被转换成 OpenAI 形状的 `tool_calls`（chat）或 `function_call` item（responses）；非流式与 SSE 流式、`tool_choice` 的 `auto`/`none`/`required`/指定函数、`parallel_tool_calls` 都支持。
 - ⚠️ **桥不执行工具**：它只负责"把模型的调用请求交给客户端、再把客户端的结果带回去"。真正读写文件、跑命令的是你的客户端；historically 这一点最容易误解，所以单独写出来。
 - ⚠️ **只支持 `type: "function"` 工具**：其它工具类型（包括混合工具列表里的非函数工具）明确拒绝，不再静默丢弃。
-- ⚠️ **输出上限不支持**：默认兼容模式接受这些参数但通过 `X-Bridge-Warnings` 告知未兑现；`BRIDGE_STRICT_COMPATIBILITY=true` 时拒绝。不会截断字符来冒充 token 预算。
+- ⚠️ **输出上限不支持**：默认兼容模式接受这些参数但通过 `X-Bridge-Compatibility-Warnings` 告知未兑现；`BRIDGE_STRICT_COMPATIBILITY=true` 时拒绝。不会截断字符来冒充 token 预算。
 
 验证方式（2026-09-10 实测，都是打真实上游）：
 
