@@ -216,23 +216,6 @@ def test_completions_stream_skips_chat_role_chunk(monkeypatch):
     assert chunks[1]["choices"][0]["finish_reason"] == "stop"
 
 
-def test_required_tool_choice_reports_openai_error():
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "gpt-5.5",
-            "messages": [{"role": "user", "content": "hello"}],
-            "tools": [{"type": "function", "function": {"name": "demo", "parameters": {"type": "object"}}}],
-            "tool_choice": {"type": "function", "function": {"name": "demo"}},
-        },
-    )
-
-    assert response.status_code == 501
-    data = response.json()
-    assert data["error"]["code"] == "unsupported_tool_calling"
-    assert data["error"]["param"] == "tool_choice"
-
-
 def test_image_generation_route_returns_b64_payload(monkeypatch):
     async def _fake_image_generation(request):
         return (

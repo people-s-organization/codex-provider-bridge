@@ -326,13 +326,13 @@ def capabilities() -> dict[str, Any]:
             ),
         },
         "tool_calling": {
-            "available": False,
+            "available": True,
             "scope": "bridge",
             "upstream_supports_function_tools": True,
             "detail": (
-                "The Codex responses upstream accepts custom function tools and returns "
-                "function_call items (verified), but this bridge neither forwards client "
-                "tools nor emits tool_calls: text answers only for now."
+                "Function tools are forwarded to the Codex responses channel and streamed "
+                "function_call items are converted into OpenAI tool_calls / function_call "
+                "output. Non-function tool types (e.g. web_search) are dropped."
             ),
         },
     }

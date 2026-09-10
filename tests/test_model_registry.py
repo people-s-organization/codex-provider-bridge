@@ -197,7 +197,7 @@ def test_capabilities_report_image_tool_models(monkeypatch):
     assert caps["source"] == "chatgpt_models"
     assert caps["image_generation"] == {"available": True, "tool_models": ["gpt-a", "gpt-b"]}
     assert caps["realtime_speech"]["model_listing"] is False
-    assert caps["tool_calling"]["available"] is False
+    assert caps["tool_calling"]["available"] is True
     assert caps["tool_calling"]["scope"] == "bridge"
 
 
@@ -206,7 +206,7 @@ def test_capabilities_without_a_source_report_unavailable():
 
     assert caps["source"] == "none"
     assert caps["image_generation"] == {"available": False, "tool_models": []}
-    assert caps["tool_calling"]["available"] is False
+    assert caps["tool_calling"]["available"] is True
     assert caps["error"]
 
 

@@ -183,22 +183,23 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 ### 能力边界（先说清楚）
 
 - ✅ **文本问答**：单轮、多轮、SSE 流式都可用；`reasoning_effort`、JSON schema 约束、旧 Completions 形状都走得通。
-- ❌ **工具调用（tool calling）没有打通**。客户端传的 `tools` / `functions` 不会被转发给上游，只会被追加一句兼容说明；`tool_choice="required"` 或指定函数会直接返回 `501 unsupported_tool_calling`；桥返回的 `tool_calls` / `function_call` 恒为 `null`。
-- 因此：Agent 客户端接上这个桥能拿到**文字回答**，但拿不到 `tool_calls`，也就无法据此读文件、改代码、执行命令。**能聊天 ≠ 具备完整开发能力。**
-- 「历史重放」不等于「有工具能力」：桥会把客户端历史里已有的 `tool_calls` / `role:"tool"` 结果按上游格式重放（见下），那只是**入站兼容**，不代表模型能发起新的工具调用。
-- 目前唯一真正被上游执行过的工具是图片生成（`image_generation`），它由桥内部发起，不暴露给客户端。
+- ✅ **函数工具调用（function tool calling）**：`tools` / 旧版 `functions` 会转发给上游，上游流式返回的 `function_call` 会被转换成 OpenAI 形状的 `tool_calls`（chat）或 `function_call` item（responses）；非流式与 SSE 流式、`tool_choice` 的 `auto`/`none`/`required`/指定函数、`parallel_tool_calls` 都支持。
+- ⚠️ **桥不执行工具**：它只负责"把模型的调用请求交给客户端、再把客户端的结果带回去"。真正读写文件、跑命令的是你的客户端；historically 这一点最容易误解，所以单独写出来。
+- ⚠️ **只转发 `type: "function"` 的工具**：其它工具类型（如 `web_search`）会被丢弃，并在 instructions 里留一条说明。
+- ⚠️ **输出上限不支持**：`max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 上游一律拒绝，桥直接忽略。
 
-#### 上游能力已实测：支持自定义函数工具（但桥还没实现）
+验证方式（2026-09-10 实测，都是打真实上游）：
 
-2026-09-10 对 `POST $CHATGPT_BASE_URL/backend-api/codex/responses` 做了对照实验，结论是**限制在桥这边，不在上游**：
+| 场景 | 结果 |
+|---|---|
+| 非流式 chat + `tools` | `finish_reason: "tool_calls"`，`tool_calls[0].function = {"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}`，`content: null` |
+| 流式 chat | 先发 `{"index":0,"id":"call_…","type":"function","function":{"name":…,"arguments":""}}`，再发参数增量分片，最后 `finish_reason: "tool_calls"` |
+| 并行调用 | 两个工具各返回一条独立 `tool_calls`，`index` 分别为 0/1 |
+| 回填闭环 | 回放 `tool_calls` + `role:"tool"` 结果后，模型给出 `It's currently 18°C and sunny in Paris.` |
+| `/v1/responses` | 非流式输出 `function_call` item（`call_id`/`name`/`arguments`），流式透传 `response.function_call_arguments.delta` 等事件 |
+| `strict: true` 工具 schema | 上游接受（HTTP 200） |
 
-| 实验 | 请求 | 结果 |
-|---|---|---|
-| A | `tools:[{"type":"function","name":"get_weather","parameters":{...}}]` + `tool_choice:"auto"` | **200**，流里出现 `response.function_call_arguments.delta/done` 与 `response.output_item.done`，item 为 `{"type":"function_call","name":"get_weather","call_id":"call_OVk92rrcFvqR6ij1GbcjawKR","arguments":"{\"city\":\"Paris\"}"}`，无正文 |
-| B | 同上但 `tool_choice:"required"` | **200**，同样返回 `function_call` |
-| C | 回放该 `function_call` + `function_call_output: "18C and sunny"` 再提问 | **200**，正文 `The weather in Paris right now is 18°C and sunny.` |
-
-也就是说**完整的工具调用闭环（模型发起调用 → 客户端执行 → 回填结果 → 模型作答）在上游是通的**，缺的是桥的转发与解析。把这条写在这里是为了不再出现"以为支持 / 以为不支持"的误判；在真正实现之前，**通过本桥依然拿不到 `tool_calls`**，`/health` 的 `capabilities.tool_calling` 也仍然返回 `available: false`（`scope: bridge`）。
+`/health` 的 `capabilities.tool_calling` 会返回 `available: true`（`scope: bridge`）。
 
 ### 文本接口
 
@@ -214,7 +215,7 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 
 尽量兼容但不能完全等价的地方：
 
-- `tool_choice="required"`、指定函数调用、强制 `function_call` 会返回 `501 unsupported_tool_calling`。原因是这个桥没有把工具能力接出来（见「能力边界」）：客户端工具定义不会转发给上游，响应里也不会产生 `tool_calls`，所以桥接层无法伪造会被客户端正确执行的工具调用。注意这不影响"客户端自己历史里的工具调用与结果被重建并透传"（见上）。
+- `tool_choice="required"`、指定函数、`parallel_tool_calls` 都已支持（见「能力边界」）；桥只转发调用、不执行工具，工具的真正执行方是客户端。只有 `type` 不是 `function` 的工具（如 `web_search`）会被丢弃并留一条说明。
 - `n > 1`、`best_of`、`logprobs` 会返回明确错误。原因是上游 Codex responses 通道按 turn 返回单个回答，也不返回 token 级 logprobs。
 - `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 不转发给上游：实测 Codex responses 通道对这四个参数一律返回 `400 Unsupported parameter`，因此桥接层直接忽略输出上限（传了不会报错，但也不会生效）。
 - Chat Completions 的音频输出 modality 不走这里；请用 `/v1/audio/speech`。音频输入、转写、翻译等端点如果需要完整 OpenAI 行为，请配置 `OPENAI_API_KEY` 走代理。

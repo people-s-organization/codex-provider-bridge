@@ -26,6 +26,112 @@ from schemas import (
 )
 
 
+class ToolCallAccumulator:
+    """Collects streamed Codex ``function_call`` items into OpenAI-shaped tool calls.
+
+    Upstream announces each call with ``response.output_item.added`` (carrying the id,
+    call_id and name), streams the arguments as ``response.function_call_arguments.delta``
+    and finishes with ``response.output_item.done`` holding the complete arguments.
+    """
+
+    def __init__(self) -> None:
+        self._calls: dict[str, dict[str, Any]] = {}
+        self._order: list[str] = []
+
+    def register(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        item_id = str(item.get("id") or "").strip()
+        if not item_id:
+            return None
+
+        call = self._calls.get(item_id)
+        if call is None:
+            call = {
+                "id": str(item.get("call_id") or "").strip() or f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {
+                    "name": str(item.get("name") or "").strip(),
+                    "arguments": "",
+                },
+            }
+            self._calls[item_id] = call
+            self._order.append(item_id)
+        else:
+            if item.get("call_id"):
+                call["id"] = str(item["call_id"])
+            if item.get("name"):
+                call["function"]["name"] = str(item["name"])
+
+        arguments = item.get("arguments")
+        if isinstance(arguments, str) and arguments:
+            call["function"]["arguments"] = arguments
+
+        return call
+
+    def append_arguments(self, item_id: str, delta: str) -> dict[str, Any] | None:
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            return None
+
+        call = self._calls.get(item_id) or self.register({"id": item_id})
+        if call is None:
+            return None
+
+        call["function"]["arguments"] += delta
+        return call
+
+    def index_of(self, item_id: str) -> int:
+        item_id = str(item_id or "").strip()
+        return self._order.index(item_id) if item_id in self._order else len(self._order)
+
+    def __bool__(self) -> bool:
+        return bool(self._order)
+
+    def as_tool_calls(self) -> list[dict[str, Any]]:
+        return [self._calls[item_id] for item_id in self._order]
+
+    def as_output_items(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": item_id,
+                "type": "function_call",
+                "status": "completed",
+                "call_id": self._calls[item_id]["id"],
+                "name": self._calls[item_id]["function"]["name"],
+                "arguments": self._calls[item_id]["function"]["arguments"],
+            }
+            for item_id in self._order
+        ]
+
+    def handle_event(self, event: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        """Apply one upstream event.
+
+        Returns the affected call (if any) and a short action marker:
+        ``added``, ``arguments``, ``done`` or an empty string when nothing happened.
+        """
+
+        event_type = event.get("type")
+
+        if event_type == "response.output_item.added":
+            item = event.get("item") or {}
+            if item.get("type") != "function_call":
+                return None, ""
+            return self.register(item), "added"
+
+        if event_type == "response.function_call_arguments.delta":
+            delta = event.get("delta") or ""
+            if not delta:
+                return None, ""
+            return self.append_arguments(str(event.get("item_id") or ""), str(delta)), "arguments"
+
+        if event_type == "response.output_item.done":
+            item = event.get("item") or {}
+            if item.get("type") != "function_call":
+                return None, ""
+            return self.register(item), "done"
+
+        return None, ""
+
+
 class ChatGPTBridge:
     def __init__(self):
         self.base_url = settings.chatgpt_base_url.rstrip("/")
@@ -395,24 +501,104 @@ class ChatGPTBridge:
         compiled_instructions = "\n\n".join(part for part in instructions if part).strip() or None
         return compiled_instructions, input_items
 
-    def _unsupported_tool_choice_error(self, tool_choice: Any, function_call: Any = None) -> dict[str, Any] | None:
-        required_tool = tool_choice == "required" or isinstance(tool_choice, dict)
-        required_function = isinstance(function_call, dict) or function_call not in {None, "none", "auto"}
-        if required_tool or required_function:
-            return {
-                "status": 501,
-                "error": "Tool calling is not implemented by this bridge",
-                "type": "unsupported_feature",
-                "param": "tool_choice",
-                "code": "unsupported_tool_calling",
-                "detail": (
-                    "The upstream Codex responses channel does accept custom function tools "
-                    "(verified), but this bridge does not forward client tools or emit "
-                    "tool_calls yet. Use tool_choice='none'/'auto' without requiring a call, "
-                    "or proxy this request with OPENAI_API_KEY."
-                ),
-            }
+    def _normalize_tool_definitions(self, tools: Any) -> tuple[list[dict[str, Any]], list[str]]:
+        """Flatten OpenAI tool definitions into the Codex responses shape.
+
+        Chat Completions nests the definition under ``function``; the Responses API and
+        the Codex backend both use the flat ``{type, name, description, parameters}``
+        shape. Only ``function`` tools are forwarded; other tool types are reported back
+        so callers can tell the model they were dropped.
+        """
+
+        forwarded: list[dict[str, Any]] = []
+        dropped_types: list[str] = []
+
+        for tool in tools or []:
+            if not isinstance(tool, dict):
+                continue
+
+            tool_type = str(tool.get("type") or "function").strip() or "function"
+            if tool_type != "function":
+                if tool_type not in dropped_types:
+                    dropped_types.append(tool_type)
+                continue
+
+            function = tool.get("function")
+            source = function if isinstance(function, dict) else tool
+
+            name = str(source.get("name") or "").strip()
+            if not name:
+                continue
+
+            definition: dict[str, Any] = {"type": "function", "name": name}
+            description = source.get("description")
+            if description:
+                definition["description"] = str(description)
+            parameters = source.get("parameters")
+            if isinstance(parameters, dict):
+                definition["parameters"] = parameters
+            if source.get("strict") is not None:
+                definition["strict"] = bool(source.get("strict"))
+
+            forwarded.append(definition)
+
+        return forwarded, dropped_types
+
+    def _normalize_tool_choice(self, tool_choice: Any, function_call: Any = None) -> Any:
+        """Map Chat Completions / Responses tool_choice onto the Codex shape."""
+
+        choice = tool_choice if tool_choice is not None else function_call
+        if choice is None:
+            return None
+
+        if isinstance(choice, str):
+            value = choice.strip().lower()
+            return value if value in {"auto", "none", "required"} else None
+
+        if isinstance(choice, dict):
+            function = choice.get("function")
+            name = ""
+            if isinstance(function, dict):
+                name = str(function.get("name") or "").strip()
+            name = name or str(choice.get("name") or "").strip()
+            if name:
+                return {"type": "function", "name": name}
+
         return None
+
+    def _apply_tools(
+        self,
+        payload: dict[str, Any],
+        instructions: str,
+        tools: Any,
+        tool_choice: Any = None,
+        function_call: Any = None,
+        legacy_functions: Any = None,
+        parallel_tool_calls: Any = None,
+    ) -> str:
+        """Attach forwarded tools to an upstream payload, returning final instructions."""
+
+        combined = list(tools or []) + list(legacy_functions or [])
+        forwarded, dropped_types = self._normalize_tool_definitions(combined)
+
+        if forwarded:
+            payload["tools"] = forwarded
+            normalized_choice = self._normalize_tool_choice(tool_choice, function_call)
+            if normalized_choice is not None:
+                payload["tool_choice"] = normalized_choice
+            if parallel_tool_calls is not None:
+                payload["parallel_tool_calls"] = bool(parallel_tool_calls)
+            return instructions
+
+        if dropped_types:
+            note = (
+                "Compatibility note: only function tools can be forwarded, so these tool "
+                f"types were dropped: {', '.join(dropped_types)}. Answer directly and do "
+                "not claim to have executed any tool."
+            )
+            return f"{instructions}\n\n{note}" if instructions else note
+
+        return instructions
 
     def _unsupported_chat_options_error(self, request: ChatCompletionRequest) -> dict[str, Any] | None:
         if request.n not in {None, 1}:
@@ -433,10 +619,7 @@ class ChatGPTBridge:
                 "code": "unsupported_chat_audio_output",
                 "detail": "Use /v1/audio/speech for text-to-speech output.",
             }
-        return self._unsupported_tool_choice_error(request.tool_choice, request.function_call)
-
-    def _unsupported_responses_options_error(self, request: ResponsesRequest) -> dict[str, Any] | None:
-        return self._unsupported_tool_choice_error(request.tool_choice)
+        return None
 
     def _augment_instructions_for_chat_response_format(
         self,
@@ -473,12 +656,16 @@ class ChatGPTBridge:
             request.response_format,
         )
 
+        tool_payload: dict[str, Any] = {}
         if request.tools or request.functions:
-            instructions = (
-                f"{instructions}\n\n"
-                "Compatibility note: tools/functions were supplied, but this bridge does not "
-                "implement tool calling yet, so no tool_calls can be requested. Answer directly "
-                "and do not claim to have executed any tool."
+            instructions = self._apply_tools(
+                tool_payload,
+                instructions,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                function_call=request.function_call,
+                legacy_functions=request.functions,
+                parallel_tool_calls=request.parallel_tool_calls,
             )
 
         payload: dict[str, Any] = {
@@ -488,6 +675,7 @@ class ChatGPTBridge:
             "store": False,
             "instructions": instructions,
         }
+        payload.update(tool_payload)
 
         reasoning_effort = self._resolve_reasoning_effort(request)
         if reasoning_effort:
@@ -537,12 +725,14 @@ class ChatGPTBridge:
             request.instructions,
             request.text.get("format") if isinstance(request.text, dict) else None,
         )
+        tool_payload: dict[str, Any] = {}
         if request.tools:
-            instructions = (
-                f"{instructions}\n\n"
-                "Compatibility note: tools were supplied, but this bridge does not implement "
-                "tool calling yet, so no tool calls can be requested. Answer directly and do "
-                "not claim to have executed any tool."
+            instructions = self._apply_tools(
+                tool_payload,
+                instructions,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
             )
 
         payload: dict[str, Any] = {
@@ -552,6 +742,7 @@ class ChatGPTBridge:
             "store": False,
             "instructions": instructions,
         }
+        payload.update(tool_payload)
         if request.reasoning and request.reasoning.effort:
             payload["reasoning"] = {"effort": request.reasoning.effort}
         # max_output_tokens is rejected upstream ("Unsupported parameter"), so the
@@ -654,6 +845,7 @@ class ChatGPTBridge:
         self, request: ChatCompletionRequest
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         full_text = []
+        tool_calls = ToolCallAccumulator()
         response_id = f"chatcmpl-{uuid.uuid4()}"
         created = int(time.time())
         usage = {
@@ -680,6 +872,14 @@ class ChatGPTBridge:
                     full_text.append(delta)
                 continue
 
+            if event_type in {
+                "response.output_item.added",
+                "response.output_item.done",
+                "response.function_call_arguments.delta",
+            }:
+                tool_calls.handle_event(event)
+                continue
+
             if event_type == "response.completed":
                 response = event.get("response", {})
                 usage = self._usage_from_response(response)
@@ -689,6 +889,7 @@ class ChatGPTBridge:
                         "created": created,
                         "model": request.model,
                         "content": "".join(full_text),
+                        "tool_calls": tool_calls.as_tool_calls(),
                         "usage": usage,
                     },
                     None,
@@ -700,6 +901,7 @@ class ChatGPTBridge:
                 "created": created,
                 "model": request.model,
                 "content": "".join(full_text),
+                "tool_calls": tool_calls.as_tool_calls(),
                 "usage": usage,
             },
             None,
@@ -712,6 +914,7 @@ class ChatGPTBridge:
         created = int(time.time())
         include_usage = bool((request.stream_options or {}).get("include_usage"))
         sent_role = False
+        tool_calls = ToolCallAccumulator()
 
         async for event in self._codex_event_stream(request):
             event_type = event.get("type")
@@ -761,6 +964,50 @@ class ChatGPTBridge:
                 yield f"data: {json.dumps(chunk)}\n\n"
                 continue
 
+            if event_type in {
+                "response.output_item.added",
+                "response.output_item.done",
+                "response.function_call_arguments.delta",
+            }:
+                call, action = tool_calls.handle_event(event)
+                if call is None or action == "done":
+                    continue
+
+                if not sent_role:
+                    role_chunk = self._chat_stream_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=request.model,
+                        delta={"role": "assistant"},
+                        include_usage=include_usage,
+                    )
+                    yield f"data: {json.dumps(role_chunk)}\n\n"
+                    sent_role = True
+
+                index = tool_calls.index_of(str(event.get("item_id") or (event.get("item") or {}).get("id") or ""))
+                if action == "added":
+                    tool_delta = {
+                        "index": index,
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {"name": call["function"]["name"], "arguments": ""},
+                    }
+                else:
+                    tool_delta = {
+                        "index": index,
+                        "function": {"arguments": str(event.get("delta") or "")},
+                    }
+
+                chunk = self._chat_stream_chunk(
+                    response_id=response_id,
+                    created=created,
+                    model=request.model,
+                    delta={"tool_calls": [tool_delta]},
+                    include_usage=include_usage,
+                )
+                yield f"data: {json.dumps(chunk)}\n\n"
+                continue
+
             if event_type == "response.completed":
                 response = event.get("response", {})
                 usage = self._usage_from_response(response)
@@ -778,7 +1025,7 @@ class ChatGPTBridge:
                     created=created,
                     model=request.model,
                     delta={},
-                    finish_reason="stop",
+                    finish_reason="tool_calls" if tool_calls else "stop",
                     include_usage=include_usage,
                 )
                 yield f"data: {json.dumps(chunk)}\n\n"
@@ -796,13 +1043,10 @@ class ChatGPTBridge:
                 return
 
     async def responses(self, request: ResponsesRequest) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        unsupported_error = self._unsupported_responses_options_error(request)
-        if unsupported_error:
-            return None, unsupported_error
-
         response_id = f"resp_{uuid.uuid4().hex}"
         created = int(time.time())
         full_text: list[str] = []
+        tool_calls = ToolCallAccumulator()
         usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -827,6 +1071,14 @@ class ChatGPTBridge:
                     full_text.append(delta)
                 continue
 
+            if event_type in {
+                "response.output_item.added",
+                "response.output_item.done",
+                "response.function_call_arguments.delta",
+            }:
+                tool_calls.handle_event(event)
+                continue
+
             if event_type == "response.completed":
                 response = event.get("response", {})
                 raw_usage = response.get("usage") or {}
@@ -837,6 +1089,24 @@ class ChatGPTBridge:
                 }
 
         output_text = "".join(full_text)
+        output: list[dict[str, Any]] = []
+        if output_text:
+            output.append(
+                {
+                    "id": f"msg_{uuid.uuid4().hex}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": output_text,
+                            "annotations": [],
+                        }
+                    ],
+                }
+            )
+        output.extend(tool_calls.as_output_items())
+
         return (
             {
                 "id": response_id,
@@ -845,32 +1115,13 @@ class ChatGPTBridge:
                 "status": "completed",
                 "model": request.model,
                 "output_text": output_text,
-                "output": [
-                    {
-                        "id": f"msg_{uuid.uuid4().hex}",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": output_text,
-                                "annotations": [],
-                            }
-                        ],
-                    }
-                ],
+                "output": output,
                 "usage": usage,
             },
             None,
         )
 
     async def responses_stream(self, request: ResponsesRequest) -> AsyncGenerator[str, None]:
-        unsupported_error = self._unsupported_responses_options_error(request)
-        if unsupported_error:
-            event = self._stream_error_event(unsupported_error)
-            yield f"event: error\ndata: {json.dumps(event)}\n\n"
-            return
-
         async for event in self._codex_event_stream_from_payload(self._build_responses_payload(request)):
             event_type = event.get("type") or "response.event"
             if event_type == "error":

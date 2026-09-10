@@ -1227,7 +1227,12 @@ async def chat_completions(request: ChatCompletionRequest):
         result, upstream_error = await bridge.chat_completion(request)
         if upstream_error:
             return upstream_error_to_response(upstream_error)
-        
+
+        tool_calls = result.get("tool_calls") or None
+        content = result["content"]
+        if tool_calls and not content:
+            content = None
+
         return {
             "id": result["id"],
             "object": "chat.completion",
@@ -1238,12 +1243,12 @@ async def chat_completions(request: ChatCompletionRequest):
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": result["content"],
+                        "content": content,
                         "refusal": None,
-                        "tool_calls": None,
+                        "tool_calls": tool_calls,
                         "function_call": None,
                     },
-                    "finish_reason": "stop",
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
                     "logprobs": None,
                 }
             ],
