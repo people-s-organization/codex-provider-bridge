@@ -118,21 +118,25 @@ def test_image_parts_are_only_valid_for_user_turns():
     assert _parts(payload, 1) == [{"type": "output_text", "text": "[image: https://x/z.png]"}]
 
 
-def test_system_messages_preserve_instruction_role():
+def test_system_and_developer_messages_become_ordered_instructions():
     bridge = ChatGPTBridge()
     payload = bridge._build_payload(
         ChatCompletionRequest(
             model="gpt-fixture-a",
             messages=[
                 {"role": "system", "content": "be brief"},
+                {"role": "developer", "content": "answer in English"},
                 {"role": "user", "content": "hello"},
             ],
         )
     )
 
-    assert payload["input"][0]["role"] == "system"
-    assert payload["input"][0]["content"] == [{"type": "input_text", "text": "be brief"}]
-    assert len(payload["input"]) == 2
+    # The backend rejects system role items in input ("System messages are not allowed").
+    assert payload["instructions"] == "be brief\n\nanswer in English"
+    assert payload["input"] == [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+    ]
+    assert all(item.get("role") not in {"system", "developer"} for item in payload["input"])
 
 
 def test_responses_input_items_are_normalized_per_role():

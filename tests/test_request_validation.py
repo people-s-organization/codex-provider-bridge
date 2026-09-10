@@ -79,9 +79,12 @@ def test_legacy_replay_is_deterministic_and_internal_only():
     first = bridge._build_payload(request)
     assert first == bridge._build_payload(request)
     assert messages == original and request.model_dump() == snapshot
-    assert [i.get("role") for i in first["input"][:2]] == ["system", "developer"]
-    assert first["input"][0]["metadata"] == {"x": 1}
-    call, result = first["input"][2:]
+    # Instruction turns keep their order and role by becoming instructions; the backend
+    # rejects system role items in input, and instructions is a plain string upstream.
+    assert first["instructions"] == "system rules\n\ndeveloper rules"
+    assert [item.get("role") for item in first["input"]] == [None, None]
+    call, result = first["input"]
+    assert call["type"] == "function_call" and result["type"] == "function_call_output"
     assert call["call_id"] == result["call_id"]
     assert "call_id" not in messages[2]["function_call"]
 
@@ -95,8 +98,9 @@ def test_responses_preserve_metadata_reasoning_and_immutability():
     original = deepcopy(items)
     request = ResponsesRequest(model="gpt-fixture-a", input=items)
     payload = ChatGPTBridge()._build_responses_payload(request)
-    assert payload["input"][1:] == original[1:]
-    payload["input"][0]["metadata"]["key"].append(2)
+    assert payload["instructions"] == "rules"
+    assert payload["input"] == original[1:]
+    payload["input"][1]["content"][0]["annotations"].append({"type": "mutated"})
     assert request.input == original and items == original
 
 
@@ -145,3 +149,22 @@ def test_explicit_non_function_history_call_type_is_rejected():
                     {"id": "call_1", "type": "web_search", "function": {"name": "run", "arguments": "{}"}}]},
             ],
         )
+
+
+def test_responses_input_never_forwards_system_or_developer_roles():
+    payload = ChatGPTBridge()._build_responses_payload(
+        ResponsesRequest(
+            model="gpt-fixture-a",
+            instructions="explicit rules",
+            input=[
+                {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "rules"}]},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "dev"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ],
+        )
+    )
+    # Upstream answers a system role inside input with 400 "System messages are not allowed".
+    assert payload["instructions"] == "explicit rules\n\nrules\n\ndev"
+    assert payload["input"] == [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+    ]

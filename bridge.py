@@ -305,22 +305,32 @@ class ChatGPTBridge:
 
         return items or [{"type": text_type, "text": ""}]
 
-    def _normalize_responses_input_items(self, request_input: Any) -> Any:
-        """Validate complete replay without demoting roles or losing opaque metadata."""
+    def _normalize_responses_input_items(self, request_input: Any) -> tuple[str | None, list[Any]]:
+        """Validate complete replay without demoting roles or losing opaque metadata.
+
+        Returns ``(instructions, items)``. The Codex backend rejects a ``system`` role
+        inside ``input`` with HTTP 400 "System messages are not allowed", so system and
+        developer turns are hoisted into the dedicated instructions field in order
+        instead of being demoted to ``user`` or forwarded as input messages.
+        """
 
         from copy import deepcopy
         from schemas import validate_response_history
 
-        if isinstance(request_input, str):
-            return request_input
         if not isinstance(request_input, list) or any(not isinstance(item, dict) for item in request_input):
             raise ValueError("Responses input must be text or an array of objects")
         validate_response_history(request_input)
         request_input = deepcopy(request_input)
+        instructions: list[str] = []
         normalized: list[Any] = []
         for item in request_input:
             role = item.get("role")
-            if role not in {"user", "assistant", "system", "developer"} or "content" not in item:
+            if role in {"system", "developer"} and "content" in item:
+                text = self._stringify_content(item.get("content")).strip()
+                if text:
+                    instructions.append(text)
+                continue
+            if role not in {"user", "assistant"} or "content" not in item:
                 normalized.append(item)
                 continue
 
@@ -343,7 +353,7 @@ class ChatGPTBridge:
                 normalized_item["content"] = converted
             normalized.append(normalized_item)
 
-        return normalized
+        return "\n\n".join(instructions) or None, normalized
 
     def _tool_result_message(self, output: Any, call_id: str) -> dict[str, Any]:
         """Render a tool result the upstream will accept even without its call."""
@@ -419,8 +429,9 @@ class ChatGPTBridge:
     def _extract_instructions_and_input(self, messages) -> tuple[str | None, list[dict[str, Any]]]:
         from schemas import chat_history_items
 
-        # Keep instruction messages ordered and role-separated; never demote them.
-        return None, self._normalize_responses_input_items(chat_history_items(messages))
+        # Instruction turns keep their role and order by becoming instructions, never by
+        # being demoted to user and never as system-role input items (rejected upstream).
+        return self._normalize_responses_input_items(chat_history_items(messages))
 
     def _normalize_tool_definitions(self, tools: Any) -> tuple[list[dict[str, Any]], list[str]]:
         """Flatten OpenAI tool definitions into the Codex responses shape.
@@ -582,6 +593,7 @@ class ChatGPTBridge:
 
     def _build_responses_payload(self, request: ResponsesRequest) -> dict[str, Any]:
         request_input: Any
+        replayed_instructions: str | None = None
         if isinstance(request.input, str):
             request_input = [
                 {
@@ -591,10 +603,11 @@ class ChatGPTBridge:
                 }
             ]
         else:
-            request_input = self._normalize_responses_input_items(request.input)
+            replayed_instructions, request_input = self._normalize_responses_input_items(request.input)
 
+        instruction_parts = [part for part in (request.instructions, replayed_instructions) if part]
         instructions = self._augment_instructions_for_schema(
-            request.instructions,
+            "\n\n".join(instruction_parts) or None,
             request.text.get("format") if isinstance(request.text, dict) else None,
         )
         tool_payload: dict[str, Any] = {}
