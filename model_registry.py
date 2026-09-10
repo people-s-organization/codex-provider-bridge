@@ -325,6 +325,14 @@ def capabilities() -> dict[str, Any]:
                 "CHATGPT_REALTIME_MODEL or the request model."
             ),
         },
+        "tool_calling": {
+            "available": False,
+            "scope": "bridge",
+            "detail": (
+                "Client tools/functions are not forwarded upstream and the bridge never "
+                "emits tool_calls: text answers only, no file/command execution."
+            ),
+        },
     }
 
 

@@ -279,6 +279,11 @@ async def home(request: Request):
         "<p>Realtime speech: <code>no upstream listing</code>"
         f"<br />{html.escape(str(model_capabilities['realtime_speech']['detail']))}</p>"
     )
+    tool_calling = model_capabilities["tool_calling"]
+    tool_note = (
+        f"<p>Tool calling: <code>{'available' if tool_calling['available'] else 'not wired'}</code>"
+        f"<br />{html.escape(str(tool_calling['detail']))}</p>"
+    )
 
     return f"""
     <!DOCTYPE html>
@@ -523,6 +528,7 @@ async def home(request: Request):
               <p><code>POST /chat/completions</code></p>
               <p><code>POST /v1/responses</code></p>
               <p><code>POST /responses</code></p>
+              {tool_note}
             </article>
 
             <article class="card">

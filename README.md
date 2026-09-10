@@ -180,6 +180,15 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 
 ## 接口兼容范围
 
+### 能力边界（先说清楚）
+
+- ✅ **文本问答**：单轮、多轮、SSE 流式都可用；`reasoning_effort`、JSON schema 约束、旧 Completions 形状都走得通。
+- ❌ **工具调用（tool calling）没有打通**。客户端传的 `tools` / `functions` 不会被转发给上游，只会被追加一句兼容说明；`tool_choice="required"` 或指定函数会直接返回 `501 unsupported_tool_calling`；桥返回的 `tool_calls` / `function_call` 恒为 `null`。
+- 因此：Agent 客户端接上这个桥能拿到**文字回答**，但拿不到 `tool_calls`，也就无法据此读文件、改代码、执行命令。**能聊天 ≠ 具备完整开发能力。**
+- 「历史重放」不等于「有工具能力」：桥会把客户端历史里已有的 `tool_calls` / `role:"tool"` 结果按上游格式重放（见下），那只是**入站兼容**，不代表模型能发起新的工具调用。
+- 目前唯一真正被上游执行过的工具是图片生成（`image_generation`），它由桥内部发起，不暴露给客户端。
+- 待验证项（不要当成已支持）：Codex responses 通道**能**接受 tools 数组并执行内置工具（图片生成即为例证），但**自定义函数工具是否被该通道接受尚未验证**，所以在验证之前这里不承诺可以打通。
+
 ### 文本接口
 
 - `/v1/chat/completions`：支持普通响应和 SSE 流式响应；`messages[].content` 支持字符串，也支持常见 text / image content parts
@@ -194,7 +203,7 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 
 尽量兼容但不能完全等价的地方：
 
-- `tool_choice="required"`、指定函数调用、强制 `function_call` 会返回 `501 unsupported_tool_calling`。原因是 ChatGPT/Codex 订阅登录态目前暴露给这个桥的是 Codex responses 通道，不是完整 OpenAI tool_calls/function_call 协议；桥接层不能伪造会被客户端正确执行的工具调用。注意这只限制"让上游发起工具调用"：客户端自己历史里的工具调用与结果会被重建并透传（见上）。
+- `tool_choice="required"`、指定函数调用、强制 `function_call` 会返回 `501 unsupported_tool_calling`。原因是这个桥没有把工具能力接出来（见「能力边界」）：客户端工具定义不会转发给上游，响应里也不会产生 `tool_calls`，所以桥接层无法伪造会被客户端正确执行的工具调用。注意这不影响"客户端自己历史里的工具调用与结果被重建并透传"（见上）。
 - `n > 1`、`best_of`、`logprobs` 会返回明确错误。原因是上游 Codex responses 通道按 turn 返回单个回答，也不返回 token 级 logprobs。
 - `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 不转发给上游：实测 Codex responses 通道对这四个参数一律返回 `400 Unsupported parameter`，因此桥接层直接忽略输出上限（传了不会报错，但也不会生效）。
 - Chat Completions 的音频输出 modality 不走这里；请用 `/v1/audio/speech`。音频输入、转写、翻译等端点如果需要完整 OpenAI 行为，请配置 `OPENAI_API_KEY` 走代理。
