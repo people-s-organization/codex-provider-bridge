@@ -195,3 +195,33 @@ elif name == 'python':
         assert result.returncode == 0
         assert calls.count(restart) == 1
         assert calls.index("python -m pytest -q") < calls.index(restart)
+
+
+def test_validation_errors_name_the_offending_field_and_reason():
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-fixture-a",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "bogus",
+        },
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["message"] == "tool_choice must be auto, none, required, or a named function"
+    assert error["param"] == "tool_choice"
+    assert "hi" not in response.text
+
+
+def test_unparsable_bodies_stay_generic():
+    client = TestClient(main.app)
+    response = client.post(
+        "/v1/chat/completions",
+        content=b"{not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["message"] == "Invalid request body"
+    assert "not json" not in response.text

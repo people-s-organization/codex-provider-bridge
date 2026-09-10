@@ -230,37 +230,65 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
+# Model-level validators report only the request body location, so map their message
+# to the field a client should fix. Presentation metadata only; never echoes content.
+_VALIDATION_PARAM_HINTS = (
+    ("previous_response_id", "previous_response_id"),
+    ("store=true", "store"),
+    ("tools and legacy functions", "tools"),
+    ("tool_choice", "tool_choice"),
+    ("assistant tool_calls and function_call", "messages"),
+    ("model must be a non-empty", "model"),
+    ("reasoning_effort", "reasoning_effort"),
+)
+_TOOL_PARAM_HINTS = (
+    "function name", "function parameters", "function description", "function strict",
+    "only client-executed function tools", "tools must be an array",
+    "duplicate function name", "invalid function tool", "invalid nested function tool",
+)
+_HISTORY_PARAM_HINTS = (
+    "assistant tool_calls", "only assistant messages", "unsupported message role",
+    "unsupported Responses message role", "orphan", "duplicate function call id",
+    "function calls require matching outputs", "history items must be objects",
+    "message history requires a role", "ambiguous legacy function calls",
+    "function call requires", "function call arguments", "function call output must be",
+)
+
+
+def validation_param_for(request: Request, message: str, param: str | None) -> str | None:
+    if param:
+        return param
+    if message.startswith(_TOOL_PARAM_HINTS):
+        return "tools"
+    if message.startswith(_HISTORY_PARAM_HINTS):
+        return "input" if request.url.path.rstrip("/").endswith("/responses") else "messages"
+    for prefix, field in _VALIDATION_PARAM_HINTS:
+        if message.startswith(prefix):
+            return field
+    return None
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     first_error = exc.errors()[0] if exc.errors() else {}
     loc = [str(part) for part in first_error.get("loc", []) if part != "body"]
     param = ".".join(loc) or None
-    # Only disclose known static validation messages, never arbitrary validator text.
-    message = str(first_error.get("msg", "")).removeprefix("Value error, ")
-    safe_messages = {
-        "Field required", "Input should be a valid string", "Input should be a valid boolean",
-        "model must be a non-empty model id",
-        "only client-executed function tools are supported; tool type must be function",
-        "tools and legacy functions cannot both be specified",
-        "tool_choice and function_call cannot both be specified",
-        "tool_choice names an undefined function",
-        "tool_choice required needs at least one function",
-        "tool_choice must be auto, none, required, or a named function",
-        "function call arguments must be a JSON object string",
-        "function calls require matching outputs before a new model turn",
-        "orphan or duplicate function call output",
-        "orphan legacy function result", "duplicate function call id",
-        "function name must contain 1-64 letters, digits, underscores or hyphens",
-        "function parameters must be a JSON Schema object",
-        "function parameters must describe an object",
-        "unsupported message role", "unsupported Responses message role",
-        "previous_response_id is unavailable; supply complete history",
-        "store=true is unavailable; the bridge does not persist responses",
-        "reasoning_effort must be one of: low, medium, high, xhigh (extra high)",
-    }
+    # "value_error" is only produced by this project's own validators, whose messages
+    # never embed request content; pydantic's own parse errors are summarised instead.
+    if first_error.get("type") == "value_error":
+        raw = str(first_error.get("msg", "")).removeprefix("Value error, ").strip()
+        message = "".join(character for character in raw if character.isprintable())[:200]
+    else:
+        message = "Invalid request body"
+    param = validation_param_for(request, message, param)
+    logging.getLogger(__name__).warning(
+        "request_validation_failed request_id=%s param=%s error_type=%s reason=%s",
+        getattr(request.state, "request_id", None), param,
+        first_error.get("type"), message,
+    )
     return openai_error_response(
         status_code=422,
-        message=message if message in safe_messages else "Invalid request body",
+        message=message or "Invalid request body",
         error_type="invalid_request_error",
         param=param,
         code="invalid_request",

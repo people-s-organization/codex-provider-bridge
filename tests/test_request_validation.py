@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 
 from bridge import ChatGPTBridge
-from schemas import ChatCompletionRequest, CompletionRequest, ResponsesRequest
+from schemas import ChatCompletionRequest, CompletionRequest, ResponsesRequest, chat_history_items
 
 
 def chat(**kwargs):
@@ -119,3 +119,29 @@ def test_duplicate_results_and_call_ids_rejected():
     for items in ([call, output, output], [call, call, output], [output, call]):
         with pytest.raises(ValueError):
             ResponsesRequest(model="gpt-fixture-a", input=items)
+
+
+def test_history_tool_calls_may_omit_the_constant_type():
+    request = ChatCompletionRequest(
+        model="gpt-fixture-a",
+        messages=[
+            {"role": "user", "content": "list"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "function": {"name": "run", "arguments": '{"x":1}'}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ],
+    )
+    items = chat_history_items(request.messages)
+    assert [item["type"] for item in items] == ["message", "function_call", "function_call_output"]
+    assert items[1]["name"] == "run"
+
+
+def test_explicit_non_function_history_call_type_is_rejected():
+    with pytest.raises(ValueError):
+        ChatCompletionRequest(
+            model="gpt-fixture-a",
+            messages=[
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "call_1", "type": "web_search", "function": {"name": "run", "arguments": "{}"}}]},
+            ],
+        )

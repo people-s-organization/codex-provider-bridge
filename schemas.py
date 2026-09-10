@@ -282,7 +282,9 @@ def chat_history_items(messages):
             raise ValueError("assistant tool_calls and function_call cannot both be specified")
         if message.role == "assistant":
             for call in message.tool_calls or []:
-                if call.get("type") != "function" or not isinstance(call.get("function"), dict):
+                # Clients routinely replay history without repeating the constant
+                # "type": "function"; only an explicit different type is an error.
+                if (call.get("type") or "function") != "function" or not isinstance(call.get("function"), dict):
                     raise ValueError("assistant tool_calls must contain function objects")
                 function = call["function"]
                 item = {"type": "function_call", "call_id": call.get("id"), "name": function.get("name"), "arguments": function.get("arguments")}
