@@ -5,10 +5,17 @@ whether the upstream performed work. Clients may explicitly retry surfaced error
 """
 import asyncio
 import json
+import logging
 import os
+import re
 import weakref
 
 import httpx
+
+# Upstream 4xx bodies name the offending parameter or input item; clients need that to
+# fix a request, while credentials and raw payload echoes must never be forwarded.
+_CREDENTIAL = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)")
+_DETAIL_LIMIT = 300
 
 
 def positive_env(name, default):
@@ -21,6 +28,34 @@ def positive_env(name, default):
 def error_event(status, code, message):
     return {"type": "error", "status": status, "code": code,
             "error": message, "detail": message}
+
+
+def safe_upstream_detail(body):
+    """Extract a bounded, credential-free explanation from an upstream error body."""
+
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body.decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        return ""
+    candidates = []
+    if isinstance(payload, dict):
+        candidates.append(payload.get("detail"))
+        candidates.append(payload.get("message"))
+        error = payload.get("error")
+        if isinstance(error, dict):
+            candidates.extend([error.get("message"), error.get("detail")])
+        else:
+            candidates.append(error)
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        text = "".join(character for character in candidate if character.isprintable()).strip()
+        if not text:
+            continue
+        return _CREDENTIAL.sub("[redacted]", text)[:_DETAIL_LIMIT]
+    return ""
 
 
 class UpstreamTransport:
@@ -57,9 +92,18 @@ class UpstreamTransport:
         try:
             async with self.client().stream("POST", url, headers=headers, json=payload) as response:
                 if response.status_code != 200:
-                    # Do not expose raw upstream pages, tokens, prompts or account details.
+                    # Never forward raw upstream pages, headers or account details, but do
+                    # forward the upstream's own explanation of the rejected request.
+                    detail = safe_upstream_detail(await response.aread())
                     event = error_event(response.status_code, "upstream_http_error",
                                         f"Upstream returned HTTP {response.status_code}")
+                    if detail:
+                        event["detail"] = detail
+                        event["upstream_detail"] = detail
+                    logging.getLogger(__name__).warning(
+                        "upstream_rejected status=%s detail=%s",
+                        response.status_code, detail or "(no structured detail)",
+                    )
                     retry_after = response.headers.get("retry-after", "")
                     if retry_after.isdigit():
                         event["retry_after"] = retry_after
