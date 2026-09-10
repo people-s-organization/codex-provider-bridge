@@ -112,7 +112,7 @@ def test_unexpected_error_sanitized(monkeypatch):
 
 def test_validation_does_not_echo_input():
     response = TestClient(main.app).post("/responses", content='{"secret-token":', headers={"Content-Type": "application/json"})
-    assert response.status_code == 422
+    assert response.status_code == 400
     assert "secret-token" not in response.text
 
 
@@ -207,7 +207,7 @@ def test_validation_errors_name_the_offending_field_and_reason():
             "tool_choice": "bogus",
         },
     )
-    assert response.status_code == 422
+    assert response.status_code == 400
     error = response.json()["error"]
     assert error["message"] == "tool_choice must be auto, none, required, or a named function"
     assert error["param"] == "tool_choice"
@@ -221,7 +221,8 @@ def test_unparsable_bodies_stay_generic():
         content=b"{not json",
         headers={"Content-Type": "application/json"},
     )
-    assert response.status_code == 422
+    assert response.status_code == 400
     error = response.json()["error"]
     assert error["message"] == "Invalid request body"
+    assert error["param"] is None
     assert "not json" not in response.text

@@ -139,6 +139,10 @@ CHATGPT_MODELS_URL=
 CHATGPT_CAPABILITIES_URL=
 CHATGPT_MODEL_ALIASES=
 CHATGPT_EXTRA_MODEL_ALIASES=
+BRIDGE_RESPONSE_STORE_MAX=256
+BRIDGE_RESPONSE_STORE_TTL=3600
+BRIDGE_CORS_ORIGINS=*
+STREAM_KEEPALIVE_SECONDS=15
 ```
 
 说明：
@@ -160,6 +164,9 @@ CHATGPT_EXTRA_MODEL_ALIASES=
 - `CHATGPT_MODELS_URL`：缓存为空时向上游查询模型列表的地址，默认 `$CHATGPT_BASE_URL/backend-api/codex/models`；设为空值即关闭上游查询
 - `CHATGPT_CAPABILITIES_URL`：能力探测地址（ChatGPT web 模型列表，用 `enabled_tools` 标记图片工具），默认 `$CHATGPT_BASE_URL/backend-api/models`；设为空值即关闭能力探测
 - `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES`：模型别名映射，支持 JSON 对象或 `old=new,old2=new2`；默认不含任何别名
+- `BRIDGE_RESPONSE_STORE_MAX` / `BRIDGE_RESPONSE_STORE_TTL`：桥自存的 Responses 数量上限与过期秒数，仅进程内存储
+- `BRIDGE_CORS_ORIGINS`：允许的浏览器来源，逗号分隔；`*` 表示任意来源（此时不允许携带凭据）
+- `STREAM_KEEPALIVE_SECONDS`：SSE 空闲多少秒后发 `: ping` 注释行，0 关闭
 
 ## 使用方式
 
@@ -181,6 +188,35 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 运维参数、严格兼容模式、回滚部署与真实 Agent 验收见 [OPERATIONS.md](OPERATIONS.md)。
 
 ## 接口兼容范围
+
+### OpenAI API 端点对照
+
+| 端点 | 状态 | 说明 |
+|---|---|---|
+| `GET /v1/models` | ✅ | 真实发现结果，无写死列表、无兜底 |
+| `GET /v1/models/{id}` | ✅ | 命中返回 model 对象，未命中 `404 model_not_found` |
+| `POST /v1/chat/completions` | ✅ | 文本、流式、工具调用、图片输入 |
+| `POST /v1/responses` | ✅ | 文本、流式、工具调用、`store`、`previous_response_id` |
+| `GET /v1/responses/{id}` | ✅ | 读取桥自存的响应（进程内，见下） |
+| `DELETE /v1/responses/{id}` | ✅ | 删除桥自存的响应 |
+| `POST /v1/completions` | ✅ | 旧 Completions 形状，映射到一次文本调用 |
+| `POST /v1/images/generations` | ✅ | Codex `image_generation` 工具；无凭据时 `501` |
+| `POST /v1/audio/speech` | ✅ | Codex realtime；无凭据时 `501` |
+| `POST /v1/responses/input_tokens` | ❌ | 订阅通道不提供 tokenizer，不返回编造的数字 |
+| `POST /v1/embeddings` / `moderations` | ❌ | 订阅通道不暴露这两个能力；配 `OPENAI_API_KEY` 时按原样代理 |
+| `files` / `batches` / `fine_tuning` / `vector_stores` / `assistants` | ❌ | 同上：无凭据时 `501 unsupported_endpoint`，有凭据时代理 |
+| `audio/transcriptions`、`audio/translations`、`images/edits`、`images/variations` | ❌ | 同上 |
+
+❌ 的端点不会返回假数据：没有真实能力就返回带原因的 `501`，配置 `OPENAI_API_KEY` 后原样代理到官方 API。未知路径返回 `404 Invalid URL (...)`，与官方行为一致。
+
+### 协议层一致性
+
+- 请求校验失败返回 **`400`** + `{"error":{"message","type","param","code"}}`，`param` 指向出错字段；错误信息只包含桥自己写的静态文本，不回显请求内容。
+- 未知模型返回 **`404 model_not_found`**（仅当模型列表确实可用时判定；发现源为空时交给上游判断）。
+- `store` / `previous_response_id`：上游是无状态且拒绝 `store`，所以**桥自己**维护一个有界、过期、仅进程内的响应存储（`BRIDGE_RESPONSE_STORE_MAX`、`BRIDGE_RESPONSE_STORE_TTL`）。`store` 默认 `true`（与官方一致），`store:false` 时不存，之后用该 id 续链会得到 `404 previous_response_not_found`。重启即失效，多进程不共享；需要跨重启持久化就不要依赖它。
+- 流式响应是 `text/event-stream`，空闲超过 `STREAM_KEEPALIVE_SECONDS`（默认 15，0 关闭）会发 `: ping` 注释行，避免代理断流；结束时发 `data: [DONE]`。
+- 浏览器直连可用：`BRIDGE_CORS_ORIGINS` 控制允许的来源（默认 `*`，配置具体来源时才允许凭据）。
+- 401 使用 `{"error":{"code":"invalid_api_key",...}}`，限流类上游错误保留状态码与 `Retry-After`。
 
 ### 能力边界（先说清楚）
 

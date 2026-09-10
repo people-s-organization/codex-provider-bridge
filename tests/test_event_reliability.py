@@ -29,7 +29,7 @@ def bridge_for(events):
 
 
 def request(legacy=False):
-    return ChatCompletionRequest(model="gpt-5.5", messages=[{"role": "user", "content": "hi"}], **({"functions": [{"name": "f1"}]} if legacy else {}))
+    return ChatCompletionRequest(model="gpt-fixture-a", messages=[{"role": "user", "content": "hi"}], **({"functions": [{"name": "f1"}]} if legacy else {}))
 
 
 def streamed(bridge, legacy=False):
@@ -71,7 +71,7 @@ def test_done_and_terminal_only_arguments(mode):
 def test_retains_order_metadata_and_fills_terminal_output():
     items = [{"type": "reasoning", "id": "r1", "summary": [{"type": "summary_text", "text": "thought"}], "encrypted_content": "opaque"}, {"type": "message", "id": "m1", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "hello", "annotations": [{"type": "url_citation", "url": "https://example.com"}]}]}, call(1, "{}")]
     events = [{"type": "response.output_item.done", "output_index": i * 3, "item": item} for i, item in enumerate(items)] + [terminal()]
-    req = ResponsesRequest(model="gpt-5.5", input="hi")
+    req = ResponsesRequest(model="gpt-fixture-a", input="hi")
     result, error = asyncio.run(bridge_for(events).responses(req))
     assert error is None
     assert result["output"] == items
@@ -104,7 +104,7 @@ def test_length_and_responses_incomplete():
     assert error is None and result["finish_reason"] == "length"
     chunks, _ = streamed(bridge_for(events))
     assert chunks[-1]["choices"][0]["finish_reason"] == "length"
-    result, error = asyncio.run(bridge_for(events).responses(ResponsesRequest(model="gpt-5.5", input="hi")))
+    result, error = asyncio.run(bridge_for(events).responses(ResponsesRequest(model="gpt-fixture-a", input="hi")))
     assert error is None and result["status"] == "incomplete"
 
 
@@ -130,7 +130,7 @@ def test_legacy_function_call_and_reject_multiple():
 
 
 def test_responses_eof_and_failed_stream_are_not_completed():
-    req = ResponsesRequest(model="gpt-5.5", input="hi")
+    req = ResponsesRequest(model="gpt-fixture-a", input="hi")
     async def collect(events):
         return [line async for line in bridge_for(events).responses_stream(req)]
     lines = asyncio.run(collect([]))
@@ -161,7 +161,7 @@ def test_invalid_content_index_is_rejected(index):
 
 @pytest.mark.parametrize("events", [[{"type": "response.output_text.delta", "content_index": -1, "delta": "x"}], [terminal([{"type": "function_call", "id": "fc", "name": "f", "arguments": "{}"}])]])
 def test_responses_invalid_events_emit_errors(events):
-    req = ResponsesRequest(model="gpt-5.5", input="hi")
+    req = ResponsesRequest(model="gpt-fixture-a", input="hi")
     result, error = asyncio.run(bridge_for(events).responses(req))
     assert result is None and error
     async def collect():
@@ -173,7 +173,7 @@ def test_responses_invalid_events_emit_errors(events):
 
 def test_refusal_is_preserved_in_responses_and_explicit_chat_error():
     events = [{"type": "response.refusal.delta", "item_id": "m", "delta": "No"}, {"type": "response.refusal.done", "item_id": "m", "refusal": "No thanks"}, terminal()]
-    result, error = asyncio.run(bridge_for(events).responses(ResponsesRequest(model="gpt-5.5", input="hi")))
+    result, error = asyncio.run(bridge_for(events).responses(ResponsesRequest(model="gpt-fixture-a", input="hi")))
     assert error is None
     assert result["output"][0]["content"][0] == {"type": "refusal", "refusal": "No thanks"}
     result, error = asyncio.run(bridge_for(events).chat_completion(request()))

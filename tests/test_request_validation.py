@@ -44,12 +44,18 @@ def test_tool_cross_validation():
     assert chat(tool_choice="none").tool_choice == "none"
 
 
-@pytest.mark.parametrize("kwargs", [{"store": True}, {"previous_response_id": "resp_old"}])
-def test_server_state_unavailable(kwargs):
+def test_server_state_is_served_by_the_bridge_owned_store():
+    # store and previous_response_id now work through the bridge's own bounded
+    # in-memory store; an unknown previous id becomes a 404 at request time instead.
+    assert chat(store=True).store is True
+    assert ResponsesRequest(model="gpt-fixture-a", input="hi").store is True
+    request = ResponsesRequest(model="gpt-fixture-a", input="hi", previous_response_id="resp_old")
+    assert request.previous_response_id == "resp_old"
+
+
+def test_blank_previous_response_id_is_rejected():
     with pytest.raises(ValueError):
-        chat(**kwargs)
-    with pytest.raises(ValueError):
-        ResponsesRequest(model="gpt-fixture-a", input="hi", **kwargs)
+        ResponsesRequest(model="gpt-fixture-a", input="hi", previous_response_id="   ")
 
 
 def test_explicit_only_compatibility_warnings_and_strict(monkeypatch):
@@ -168,3 +174,10 @@ def test_responses_input_never_forwards_system_or_developer_roles():
     assert payload["input"] == [
         {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
     ]
+
+
+def test_chat_store_is_reported_as_ignored_and_responses_store_is_honoured():
+    assert "store is ignored by the Codex bridge for chat completions" in chat(store=True).compatibility_warnings()
+    assert "store is ignored by the Codex bridge for chat completions" not in chat(store=False).compatibility_warnings()
+    # Responses storage is bridge-owned, so it must never be reported as ignored.
+    assert ResponsesRequest(model="gpt-fixture-a", input="hi", store=True).compatibility_warnings() == []

@@ -1,6 +1,6 @@
 import argparse
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 import logging
 from functools import wraps
@@ -11,16 +11,22 @@ import subprocess
 import uuid
 import html
 import json
+import os
 import socket
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import httpx
 
 from config import settings
-from model_registry import model_snapshot
+from model_registry import (
+    is_available_model,
+    model_aliases,
+    model_snapshot,
+)
 from schemas import (
     AudioSpeechRequest,
     ChatCompletionRequest,
@@ -94,7 +100,7 @@ class OperationalMiddleware:
             supplied = headers.get(b"authorization", b"")
             scheme, _, token = supplied.partition(b" ")
             if scheme.lower() != b"bearer" or not secrets.compare_digest(token, settings.bridge_api_key.encode()):
-                return await reject(401, "Invalid bridge API key", "invalid_api_key")
+                return await reject(401, "Incorrect API key provided", "invalid_api_key")
         if not health and self.active >= settings.max_concurrent_requests:
             return await reject(429, "Bridge request capacity exceeded", "concurrency_limit")
         if not health:
@@ -150,7 +156,92 @@ class OperationalMiddleware:
                 self.active -= 1
 
 
+CORS_ALLOW_METHODS = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
+CORS_ALLOW_HEADERS = "authorization, content-type, x-request-id, openai-*, x-stainless-*"
+CORS_EXPOSE_HEADERS = "x-request-id, x-bridge-warnings, x-bridge-compatibility-warnings"
+CORS_MAX_AGE = "600"
+
+
+def cors_allowed_origins() -> list[str]:
+    """Configured origins, read per request so tests/operators can change them.
+
+    ``*`` (the default) allows any origin but forbids credentials, matching the
+    Fetch spec; an explicit list enables ``Access-Control-Allow-Credentials``.
+    """
+
+    raw = os.getenv("BRIDGE_CORS_ORIGINS")
+    if raw is None:
+        raw = settings.cors_origins
+    origins = [item.strip() for item in str(raw).split(",") if item.strip()]
+    return origins or ["*"]
+
+
+class BridgeCORSMiddleware:
+    """Minimal CORS layer that runs before auth so browser preflights succeed."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        origin = headers.get("origin")
+        if not origin:
+            return await self.app(scope, receive, send)
+
+        origins = cors_allowed_origins()
+        wildcard = "*" in origins
+        allowed = wildcard or origin in origins
+        requested_method = headers.get("access-control-request-method")
+
+        if scope["method"] == "OPTIONS" and requested_method:
+            if not allowed:
+                await send({
+                    "type": "http.response.start",
+                    "status": 400,
+                    "headers": [(b"x-request-id", uuid.uuid4().hex.encode())],
+                })
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+                return
+            allow_headers = headers.get("access-control-request-headers") or CORS_ALLOW_HEADERS
+            response_headers = [
+                (b"access-control-allow-origin", b"*" if wildcard else origin.encode("latin-1")),
+                (b"access-control-allow-methods", CORS_ALLOW_METHODS.encode()),
+                (b"access-control-allow-headers", allow_headers.encode("latin-1")),
+                (b"access-control-max-age", CORS_MAX_AGE.encode()),
+                (b"x-request-id", uuid.uuid4().hex.encode()),
+            ]
+            if not wildcard:
+                response_headers.append((b"access-control-allow-credentials", b"true"))
+                response_headers.append((b"vary", b"Origin"))
+            await send({"type": "http.response.start", "status": 200, "headers": response_headers})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            return
+
+        if not allowed:
+            return await self.app(scope, receive, send)
+
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                response_headers = list(message.get("headers", []))
+                response_headers.append(
+                    (b"access-control-allow-origin", b"*" if wildcard else origin.encode("latin-1"))
+                )
+                if not wildcard:
+                    response_headers.append((b"access-control-allow-credentials", b"true"))
+                    response_headers.append((b"vary", b"Origin"))
+                response_headers.append((b"access-control-expose-headers", CORS_EXPOSE_HEADERS.encode()))
+                message = {**message, "headers": response_headers}
+            await send(message)
+
+        return await self.app(scope, receive, send_with_cors)
+
+
 app.add_middleware(OperationalMiddleware)
+# Added last so CORS is the outermost layer: preflights must bypass bridge auth.
+app.add_middleware(BridgeCORSMiddleware)
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 WILDCARD_HOSTS = {"0.0.0.0", "::", ""}
 ACTIVE_HOST = settings.host
@@ -168,6 +259,28 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+# OpenAI REST capabilities the subscription channel does not expose. Requests here get
+# an honest ``unsupported_endpoint`` error instead of a misleading "invalid URL", and
+# still proxy to the official API when OPENAI_API_KEY is configured.
+_UNSUPPORTED_V1_PREFIXES = (
+    "embeddings",
+    "moderations",
+    "files",
+    "batches",
+    "fine_tuning",
+    "vector_stores",
+    "assistants",
+    "audio/transcriptions",
+    "audio/translations",
+    "images/edits",
+    "images/variations",
+    "responses/input_tokens",
+)
+
+
+def unsupported_v1_capability(path: str) -> bool:
+    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in _UNSUPPORTED_V1_PREFIXES)
 
 
 def openai_error_payload(
@@ -206,12 +319,30 @@ def upstream_error_to_response(error: dict, fallback_status: int = 502) -> JSONR
         status_code = fallback_status
     if not 400 <= status_code <= 599:
         status_code = 502
-    response = openai_error_response(
-        status_code=status_code,
-        message="Upstream request failed",
-        error_type="api_error" if status_code >= 500 else "invalid_request_error",
-        code="upstream_error",
-    )
+    if error.get("local"):
+        # Bridge-authored errors carry static, non-echoing text and a precise code;
+        # surface their message/type/param/code verbatim instead of sanitising them away.
+        message = error.get("error")
+        response = openai_error_response(
+            status_code=status_code,
+            message=message if isinstance(message, str) and message else "Request failed",
+            error_type=str(error.get("type") or "invalid_request_error"),
+            param=error.get("param"),
+            code=error.get("code"),
+        )
+    else:
+        upstream_detail = error.get("upstream_detail")
+        message = (
+            upstream_detail.strip()
+            if isinstance(upstream_detail, str) and upstream_detail.strip()
+            else "Upstream request failed"
+        )
+        response = openai_error_response(
+            status_code=status_code,
+            message=message,
+            error_type="api_error" if status_code >= 500 else "invalid_request_error",
+            code="upstream_error",
+        )
     retry_after = str(error.get("retry_after", ""))
     if re.fullmatch(r"[0-9]{1,6}", retry_after):
         response.headers["Retry-After"] = retry_after
@@ -227,6 +358,27 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         status_code=exc.status_code,
         message="Request failed" if exc.status_code >= 500 else "Invalid request",
         error_type="api_error" if exc.status_code >= 500 else "invalid_request_error",
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Routing errors (404/405) keep the OpenAI envelope and a JSON content type."""
+
+    if exc.status_code == 404:
+        message = f"Invalid URL ({request.method} {request.url.path})"
+        code = None
+    elif exc.status_code == 405:
+        message = f"Method {request.method} not allowed for {request.url.path}"
+        code = None
+    else:
+        message = "Request failed" if exc.status_code >= 500 else "Invalid request"
+        code = None
+    return openai_error_response(
+        status_code=exc.status_code,
+        message=message,
+        error_type="api_error" if exc.status_code >= 500 else "invalid_request_error",
+        code=code,
     )
 
 
@@ -271,11 +423,17 @@ def validation_param_for(request: Request, message: str, param: str | None) -> s
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     first_error = exc.errors()[0] if exc.errors() else {}
+    error_kind = first_error.get("type")
     loc = [str(part) for part in first_error.get("loc", []) if part != "body"]
     param = ".".join(loc) or None
     # "value_error" is only produced by this project's own validators, whose messages
     # never embed request content; pydantic's own parse errors are summarised instead.
-    if first_error.get("type") == "value_error":
+    if error_kind == "json_invalid":
+        # Malformed JSON: pydantic reports a byte offset as the location, which is not
+        # a request parameter. Never echo the offending body.
+        param = None
+        message = "Invalid request body"
+    elif error_kind == "value_error":
         raw = str(first_error.get("msg", "")).removeprefix("Value error, ").strip()
         message = "".join(character for character in raw if character.isprintable())[:200]
     else:
@@ -287,7 +445,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         first_error.get("type"), message,
     )
     return openai_error_response(
-        status_code=422,
+        status_code=400,
         message=message or "Invalid request body",
         error_type="invalid_request_error",
         param=param,
@@ -1278,10 +1436,13 @@ async def routes():
             {"method": "GET", "path": "/routes"},
             {"method": "GET", "path": "/models"},
             {"method": "GET", "path": "/v1/models"},
+            {"method": "GET", "path": "/v1/models/{model_id}"},
             {"method": "POST", "path": "/completions"},
             {"method": "POST", "path": "/v1/completions"},
             {"method": "POST", "path": "/responses"},
             {"method": "POST", "path": "/v1/responses"},
+            {"method": "GET", "path": "/v1/responses/{response_id}"},
+            {"method": "DELETE", "path": "/v1/responses/{response_id}"},
             {"method": "POST", "path": "/chat/completions"},
             {"method": "POST", "path": "/v1/chat/completions"},
             {"method": "POST", "path": "/images/generations"},
@@ -1359,6 +1520,102 @@ async def list_models():
     }
 
 
+def _safe_identifier(value: str) -> str:
+    """Bound a path parameter before it is quoted back in an error message."""
+
+    return "".join(character for character in value if character.isprintable())[:200]
+
+
+def _find_model(model_id: str) -> dict | None:
+    """Return the model object for a discovered id or a configured alias, else None."""
+
+    if not is_available_model(model_id):
+        resolved = model_aliases().get(model_id)
+        if not resolved or not is_available_model(resolved):
+            return None
+        return {"id": model_id, "object": "model", "created": 0, "owned_by": "openai"}
+    for model in model_snapshot()["models"]:
+        if model["id"] == model_id:
+            return model
+    return {"id": model_id, "object": "model", "created": 0, "owned_by": "openai"}
+
+
+@app.get("/v1/models/{model_id}")
+async def retrieve_model(model_id: str):
+    model = await run_in_threadpool(_find_model, model_id)
+    if model is None:
+        return openai_error_response(
+            status_code=404,
+            message=(
+                f"The model '{_safe_identifier(model_id)}' does not exist "
+                "or you do not have access to it."
+            ),
+            error_type="invalid_request_error",
+            param=None,
+            code="model_not_found",
+        )
+    return model
+
+
+@app.get("/models/{model_id}")
+async def retrieve_model_alias(model_id: str):
+    return await retrieve_model(model_id)
+
+
+async def stream_with_keepalive(source, interval: float | None = None):
+    """Emit ``: ping`` SSE comments while the wrapped stream is idle.
+
+    Upstream can think for a long time before its next event; idle connections are
+    otherwise dropped by proxies and clients. Only comment lines are injected, so the
+    bridge generators' payloads are untouched, and non-streaming responses never pass
+    through this wrapper.
+    """
+
+    if interval is None:
+        interval = settings.stream_keepalive_seconds
+    try:
+        interval = float(interval)
+    except (TypeError, ValueError):
+        interval = 0.0
+    if interval <= 0:
+        async for chunk in source:
+            yield chunk
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+    done = object()
+
+    async def pump():
+        try:
+            async for chunk in source:
+                await queue.put((False, chunk))
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer below
+            await queue.put((True, exc))
+        finally:
+            await queue.put((None, done))
+
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                is_error, value = await asyncio.wait_for(queue.get(), timeout=interval)
+            except TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if is_error is None:
+                return
+            if is_error:
+                raise value
+            yield value
+    finally:
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 def with_compatibility_warnings(handler):
     @wraps(handler)
     async def wrapped(request):
@@ -1377,7 +1634,7 @@ def with_compatibility_warnings(handler):
 async def responses(request: ResponsesRequest):
     if request.stream:
         return StreamingResponse(
-            bridge.responses_stream(request),
+            stream_with_keepalive(bridge.responses_stream(request)),
             media_type="text/event-stream",
         )
 
@@ -1392,7 +1649,7 @@ async def responses(request: ResponsesRequest):
 async def completions(request: CompletionRequest):
     if request.stream:
         return StreamingResponse(
-            bridge.completion_stream(request),
+            stream_with_keepalive(bridge.completion_stream(request)),
             media_type="text/event-stream",
         )
 
@@ -1407,7 +1664,7 @@ async def completions(request: CompletionRequest):
 async def chat_completions(request: ChatCompletionRequest):
     if request.stream:
         return StreamingResponse(
-            bridge.chat_completion_stream(request), 
+            stream_with_keepalive(bridge.chat_completion_stream(request)),
             media_type="text/event-stream"
         )
     else:
@@ -1460,8 +1717,59 @@ async def audio_speech(request: AudioSpeechRequest):
     return Response(content=audio_bytes, media_type=media_type)
 
 
+async def _stored_response_result(response_id: str, operation: str):
+    """Shared GET/DELETE plumbing for the bridge's response store."""
+
+    handler = getattr(bridge, operation, None)
+    if handler is None:
+        return openai_error_response(
+            status_code=501,
+            message=(
+                "Response storage is not available in this bridge build. "
+                "Reason: the response store is not wired into the running bridge."
+            ),
+            error_type="unsupported_endpoint",
+            param=None,
+            code="unsupported_endpoint",
+        )
+    result, error = await handler(response_id)
+    if error:
+        return upstream_error_to_response(error)
+    return result
+
+
+@app.get("/v1/responses/{response_id}")
+async def get_response(response_id: str):
+    return await _stored_response_result(response_id, "get_stored_response")
+
+
+@app.delete("/v1/responses/{response_id}")
+async def delete_response(response_id: str):
+    return await _stored_response_result(response_id, "delete_stored_response")
+
+
+@app.get("/responses/{response_id}")
+async def get_response_alias(response_id: str):
+    return await _stored_response_result(response_id, "get_stored_response")
+
+
+@app.delete("/responses/{response_id}")
+async def delete_response_alias(response_id: str):
+    return await _stored_response_result(response_id, "delete_stored_response")
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_or_explain_unimplemented_v1(path: str, request: Request):
+    if not unsupported_v1_capability(path):
+        # A route that is not part of the OpenAI surface at all is a bad URL, even
+        # with OPENAI_API_KEY configured: never proxy arbitrary paths upstream.
+        return openai_error_response(
+            status_code=404,
+            message=f"Invalid URL ({request.method} /v1/{path})",
+            error_type="invalid_request_error",
+            param=None,
+            code=None,
+        )
     if not settings.openai_api_key:
         return openai_error_response(
             status_code=501,

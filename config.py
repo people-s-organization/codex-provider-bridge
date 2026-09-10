@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     max_request_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
     max_concurrent_requests: int = Field(default=32, gt=0)
     request_body_timeout_seconds: float = Field(default=30.0, gt=0)
+    stream_keepalive_seconds: float = Field(default=15.0, ge=0)
+    cors_origins: str = "*"
     deployment_commit: str = ""
 
     def validate_network_binding(self) -> None:

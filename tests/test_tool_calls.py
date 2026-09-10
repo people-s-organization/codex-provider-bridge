@@ -54,7 +54,7 @@ def _completed():
         "type": "response.completed",
         "response": {
             "id": "resp_test",
-            "model": "gpt-5.5",
+            "model": "gpt-fixture-a",
             "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
         },
     }
@@ -81,7 +81,7 @@ def test_chat_tool_definitions_are_forwarded(monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "gpt-5.5",
+            "model": "gpt-fixture-a",
             "messages": [{"role": "user", "content": "weather?"}],
             "tools": [
                 {
@@ -118,7 +118,7 @@ def test_chat_non_stream_returns_tool_calls(monkeypatch):
 
     response = client.post(
         "/v1/chat/completions",
-        json={"model": "gpt-5.5", "messages": [{"role": "user", "content": "weather?"}]},
+        json={"model": "gpt-fixture-a", "messages": [{"role": "user", "content": "weather?"}]},
     )
 
     assert response.status_code == 200
@@ -139,7 +139,7 @@ def test_chat_stream_emits_tool_call_deltas(monkeypatch):
 
     response = client.post(
         "/v1/chat/completions",
-        json={"model": "gpt-5.5", "messages": [{"role": "user", "content": "weather?"}], "stream": True},
+        json={"model": "gpt-fixture-a", "messages": [{"role": "user", "content": "weather?"}], "stream": True},
     )
 
     assert response.status_code == 200
@@ -173,7 +173,7 @@ def test_parallel_tool_calls_get_distinct_indexes(monkeypatch):
 
     response = client.post(
         "/v1/chat/completions",
-        json={"model": "gpt-5.5", "messages": [{"role": "user", "content": "both"}]},
+        json={"model": "gpt-fixture-a", "messages": [{"role": "user", "content": "both"}]},
     )
 
     tool_calls = response.json()["choices"][0]["message"]["tool_calls"]
@@ -186,7 +186,7 @@ def test_responses_non_stream_returns_function_call_items(monkeypatch):
 
     response = client.post(
         "/v1/responses",
-        json={"model": "gpt-5.5", "input": "weather?"},
+        json={"model": "gpt-fixture-a", "input": "weather?"},
     )
 
     assert response.status_code == 200
@@ -209,7 +209,7 @@ def test_responses_stream_passes_function_call_events(monkeypatch):
 
     response = client.post(
         "/v1/responses",
-        json={"model": "gpt-5.5", "input": "weather?", "stream": True},
+        json={"model": "gpt-fixture-a", "input": "weather?", "stream": True},
     )
 
     assert response.status_code == 200
@@ -224,7 +224,7 @@ def test_non_function_tools_are_rejected_before_upstream(monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "gpt-5.5",
+            "model": "gpt-fixture-a",
             "messages": [{"role": "user", "content": "search"}],
             "tools": [{"type": "web_search"}],
         },
@@ -242,7 +242,7 @@ def test_legacy_functions_are_forwarded(monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "gpt-5.5",
+            "model": "gpt-fixture-a",
             "messages": [{"role": "user", "content": "weather?"}],
             "functions": [{"name": "get_weather", "description": "Get weather"}],
             "function_call": "auto",
@@ -271,7 +271,7 @@ def test_tool_result_round_trip_replays_call_and_output(monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "gpt-5.5",
+            "model": "gpt-fixture-a",
             "messages": [
                 {"role": "user", "content": "weather?"},
                 {

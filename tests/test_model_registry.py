@@ -151,24 +151,24 @@ def test_no_builtin_aliases_remain(monkeypatch):
 
 def test_image_request_requires_explicit_model():
     response = client.post("/v1/images/generations", json={"prompt": "hello"})
-    assert response.status_code == 422
+    assert response.status_code == 400
 
     response = client.post("/v1/images/generations", json={"model": "", "prompt": "hello"})
-    assert response.status_code == 422
+    assert response.status_code == 400
 
     response = client.post("/v1/images/generations", json={"model": "   ", "prompt": "hello"})
-    assert response.status_code == 422
+    assert response.status_code == 400
 
 
 def test_audio_request_requires_explicit_model():
     response = client.post("/v1/audio/speech", json={"input": "hello"})
-    assert response.status_code == 422
+    assert response.status_code == 400
 
     response = client.post("/v1/audio/speech", json={"model": "", "input": "hello"})
-    assert response.status_code == 422
+    assert response.status_code == 400
 
     response = client.post("/v1/audio/speech", json={"model": "   ", "input": "hello"})
-    assert response.status_code == 422
+    assert response.status_code == 400
 
 
 def test_capabilities_report_image_tool_models(monkeypatch):

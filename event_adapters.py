@@ -142,7 +142,7 @@ async def responses(bridge, request):
     return None, state.failure("Upstream stream ended before a terminal response", "upstream_stream_truncated")
 
 
-async def responses_stream(bridge, request):
+async def responses_stream(bridge, request, on_complete=None):
     state = EventAssembly()
     async for event in bridge._codex_event_stream_from_payload(bridge._build_responses_payload(request)):
         if not state.feed(event):
@@ -152,7 +152,10 @@ async def responses_stream(bridge, request):
             yield f"event: error\ndata: {json.dumps(state.error)}\n\n"
             return
         if state.terminal:
-            event = {**event, "response": response_result(state, request)}
+            result = response_result(state, request)
+            if on_complete is not None and state.terminal == "response.completed":
+                on_complete(result)
+            event = {**event, "response": result}
         yield f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
         if state.terminal or state.error:
             return

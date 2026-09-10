@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from config import settings
 from upstream_transport import UpstreamTransport
 from model_registry import default_model_id, is_available_model, resolve_model_name
+from response_store import response_store
 from schemas import (
     AudioSpeechRequest,
     ChatCompletionRequest,
@@ -487,20 +488,22 @@ class ChatGPTBridge:
     def _unsupported_chat_options_error(self, request: ChatCompletionRequest) -> dict[str, Any] | None:
         if request.n not in {None, 1}:
             return {
-                "status": 501,
-                "error": "Multiple choices are not supported by the Codex backend bridge",
-                "type": "unsupported_feature",
+                "status": 400,
+                "local": True,
+                "error": "Multiple choices (n > 1) are not supported by the Codex backend bridge",
+                "type": "invalid_request_error",
                 "param": "n",
-                "code": "unsupported_multiple_choices",
+                "code": "unsupported_value",
                 "detail": "The upstream Codex responses channel returns one assistant answer per turn.",
             }
         if request.modalities and any(modality != "text" for modality in request.modalities):
             return {
-                "status": 501,
+                "status": 400,
+                "local": True,
                 "error": "Chat Completions audio output is not supported by this bridge",
-                "type": "unsupported_feature",
+                "type": "invalid_request_error",
                 "param": "modalities",
-                "code": "unsupported_chat_audio_output",
+                "code": "unsupported_value",
                 "detail": "Use /v1/audio/speech for text-to-speech output.",
             }
         return None
@@ -591,19 +594,68 @@ class ChatGPTBridge:
             return schema_instruction
         return f"{base}\n\n{schema_instruction}"
 
-    def _build_responses_payload(self, request: ResponsesRequest) -> dict[str, Any]:
-        request_input: Any
-        replayed_instructions: str | None = None
+    def _responses_turn_items(self, request: ResponsesRequest) -> tuple[str | None, list[Any]]:
+        """Instruction text and input items for one Responses turn (without chaining)."""
+
+        if request.input is None:
+            # Only valid together with previous_response_id; chaining supplies the rest.
+            return None, []
         if isinstance(request.input, str):
-            request_input = [
+            return None, [
                 {
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": request.input}],
                 }
             ]
-        else:
-            replayed_instructions, request_input = self._normalize_responses_input_items(request.input)
+        return self._normalize_responses_input_items(request.input)
+
+    def model_not_found_error(self, requested_model: str) -> dict[str, Any] | None:
+        """Mirror the real API's 404 for a model this account cannot use.
+
+        Only enforced when the registry actually advertises a model set: with no
+        discovery source the bridge cannot know better and lets upstream answer.
+        """
+
+        from model_registry import available_model_ids
+
+        available = available_model_ids()
+        if not available or self._resolve_model_name(requested_model) in available:
+            return None
+        return {
+            "status": 404,
+            "local": True,
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "model_not_found",
+            "error": (
+                f"The model '{requested_model}' does not exist or you do not have access to it."
+            ),
+        }
+
+    def previous_response_error(self, request: ResponsesRequest) -> dict[str, Any] | None:
+        """Reject an unknown ``previous_response_id`` the way the real API does."""
+
+        previous_id = str(getattr(request, "previous_response_id", None) or "").strip()
+        if not previous_id:
+            return None
+        if response_store.conversation(previous_id) is None:
+            return {
+                "status": 404,
+                "local": True,
+                "type": "invalid_request_error",
+                "param": "previous_response_id",
+                "code": "previous_response_not_found",
+                "error": f"Previous response with id '{previous_id}' not found.",
+            }
+        return None
+
+    def _build_responses_payload(self, request: ResponsesRequest) -> dict[str, Any]:
+        replayed_instructions, request_input = self._responses_turn_items(request)
+        previous_id = str(getattr(request, "previous_response_id", None) or "").strip()
+        if previous_id:
+            # Stateless upstream: replay the stored conversation before the new turn.
+            request_input = list(response_store.conversation(previous_id) or []) + list(request_input)
 
         instruction_parts = [part for part in (request.instructions, replayed_instructions) if part]
         instructions = self._augment_instructions_for_schema(
@@ -633,13 +685,24 @@ class ChatGPTBridge:
         # request's limit is deliberately dropped here.
         return payload
 
-    def _usage_from_response(self, response: dict[str, Any]) -> dict[str, int]:
+    def _usage_from_response(self, response: dict[str, Any]) -> dict[str, Any]:
+        """OpenAI-shaped usage, carrying the token details upstream actually reports."""
+
         raw_usage = response.get("usage") or {}
-        return {
+        usage: dict[str, Any] = {
             "prompt_tokens": raw_usage.get("input_tokens", raw_usage.get("prompt_tokens", 0)),
             "completion_tokens": raw_usage.get("output_tokens", raw_usage.get("completion_tokens", 0)),
             "total_tokens": raw_usage.get("total_tokens", 0),
         }
+        input_details = raw_usage.get("input_tokens_details")
+        if isinstance(input_details, dict):
+            usage["prompt_tokens_details"] = {"cached_tokens": input_details.get("cached_tokens", 0)}
+        output_details = raw_usage.get("output_tokens_details")
+        if isinstance(output_details, dict):
+            usage["completion_tokens_details"] = {
+                "reasoning_tokens": output_details.get("reasoning_tokens", 0)
+            }
+        return usage
 
     def _stream_error_event(self, error: dict[str, Any]) -> dict[str, Any]:
         event = dict(error)
@@ -698,6 +761,9 @@ class ChatGPTBridge:
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         from event_adapters import chat_completion
 
+        model_error = self.model_not_found_error(request.model)
+        if model_error:
+            return None, model_error
         return await chat_completion(self, request)
 
     async def chat_completion_stream(
@@ -705,19 +771,79 @@ class ChatGPTBridge:
     ) -> AsyncGenerator[str, None]:
         from event_adapters import chat_completion_stream
 
+        model_error = self.model_not_found_error(request.model)
+        if model_error:
+            yield f"data: {json.dumps({'error': model_error})}\n\n"
+            return
         async for chunk in chat_completion_stream(self, request):
             yield chunk
+
+    def remember_response(self, request: ResponsesRequest, response: dict[str, Any]) -> None:
+        """Store a completed response plus the conversation it belongs to."""
+
+        if not getattr(request, "store", True):
+            return
+        previous_id = str(getattr(request, "previous_response_id", None) or "").strip()
+        chained = list(response_store.conversation(previous_id) or []) if previous_id else []
+        try:
+            _, turn_items = self._responses_turn_items(request)
+        except ValueError:
+            turn_items = []
+        conversation = chained + list(turn_items) + list(response.get("output") or [])
+        response["store"] = True
+        response_store.store(response, conversation)
 
     async def responses(self, request: ResponsesRequest) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         from event_adapters import responses
 
-        return await responses(self, request)
+        request_error = self.model_not_found_error(request.model) or self.previous_response_error(request)
+        if request_error:
+            return None, request_error
+        result, error = await responses(self, request)
+        if error is None and result is not None:
+            self.remember_response(request, result)
+        return result, error
 
     async def responses_stream(self, request: ResponsesRequest) -> AsyncGenerator[str, None]:
         from event_adapters import responses_stream
 
-        async for chunk in responses_stream(self, request):
+        request_error = self.model_not_found_error(request.model) or self.previous_response_error(request)
+        if request_error:
+            yield f"event: error\ndata: {json.dumps(self._stream_error_event(request_error))}\n\n"
+            return
+
+        def on_complete(response: dict[str, Any]) -> None:
+            self.remember_response(request, response)
+
+        async for chunk in responses_stream(self, request, on_complete=on_complete):
             yield chunk
+
+    def _missing_response_error(self, response_id: str) -> dict[str, Any]:
+        return {
+            "status": 404,
+            "local": True,
+            "type": "invalid_request_error",
+            "param": "response_id",
+            "code": "response_not_found",
+            "error": f"No response found with id '{response_id}'.",
+        }
+
+    async def get_stored_response(
+        self, response_id: str
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        response_id = str(response_id or "").strip()
+        response = response_store.get(response_id) if response_id else None
+        if response is None:
+            return None, self._missing_response_error(response_id or "(empty)")
+        return response, None
+
+    async def delete_stored_response(
+        self, response_id: str
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        response_id = str(response_id or "").strip()
+        if not response_id or not response_store.delete(response_id):
+            return None, self._missing_response_error(response_id or "(empty)")
+        return {"id": response_id, "object": "response.deleted", "deleted": True}, None
 
     def _completion_prompts(self, prompt: Any) -> list[str]:
         if prompt is None:
@@ -748,29 +874,32 @@ class ChatGPTBridge:
     def _unsupported_completion_options_error(self, request: CompletionRequest) -> dict[str, Any] | None:
         if request.n not in {None, 1}:
             return {
-                "status": 501,
+                "status": 400,
+                "local": True,
                 "error": "Multiple legacy completion choices are not supported",
-                "type": "unsupported_feature",
+                "type": "invalid_request_error",
                 "param": "n",
-                "code": "unsupported_multiple_choices",
+                "code": "unsupported_value",
                 "detail": "The bridge maps legacy /v1/completions to one chat turn per prompt.",
             }
         if request.best_of not in {None, 1}:
             return {
-                "status": 501,
+                "status": 400,
+                "local": True,
                 "error": "best_of is not supported by the bridge",
-                "type": "unsupported_feature",
+                "type": "invalid_request_error",
                 "param": "best_of",
-                "code": "unsupported_best_of",
+                "code": "unsupported_value",
                 "detail": "The upstream Codex responses channel does not expose server-side best_of sampling.",
             }
         if request.logprobs is not None:
             return {
-                "status": 501,
+                "status": 400,
+                "local": True,
                 "error": "logprobs are not supported by the Codex backend bridge",
-                "type": "unsupported_feature",
+                "type": "invalid_request_error",
                 "param": "logprobs",
-                "code": "unsupported_logprobs",
+                "code": "unsupported_value",
                 "detail": "The upstream Codex responses channel does not return token log probabilities.",
             }
         return None

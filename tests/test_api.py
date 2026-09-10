@@ -65,7 +65,7 @@ def test_responses_route_returns_openai_like_shape(monkeypatch):
     response = client.post(
         "/v1/responses",
         json={
-            "model": "gpt-5.4-mini",
+            "model": "gpt-fixture-a",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
             "text": {"format": {"type": "json_schema", "name": "demo", "schema": {"type": "object"}, "strict": True}},
         },
@@ -87,7 +87,7 @@ def test_responses_stream_route_returns_sse(monkeypatch):
 
     response = client.post(
         "/v1/responses",
-        json={"model": "gpt-5.4-mini", "input": "hello", "stream": True},
+        json={"model": "gpt-fixture-a", "input": "hello", "stream": True},
     )
 
     assert response.status_code == 200
@@ -115,7 +115,7 @@ def test_chat_completions_stream_returns_openai_chunks(monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "gpt-5.5",
+            "model": "gpt-fixture-a",
             "messages": [{"role": "user", "content": "hello"}],
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -145,7 +145,7 @@ def test_chat_content_parts_are_converted_for_codex():
     bridge = ChatGPTBridge()
     payload = bridge._build_payload(
         ChatCompletionRequest(
-            model="gpt-5.5",
+            model="gpt-fixture-a",
             messages=[
                 {"role": "system", "content": [{"type": "text", "text": "Be terse."}]},
                 {
@@ -189,7 +189,7 @@ def test_completions_route_returns_legacy_shape(monkeypatch):
 
     monkeypatch.setattr("main.bridge.completion", _fake_completion)
 
-    response = client.post("/v1/completions", json={"model": "gpt-5.5", "prompt": "hello"})
+    response = client.post("/v1/completions", json={"model": "gpt-fixture-a", "prompt": "hello"})
 
     assert response.status_code == 200
     data = response.json()
@@ -207,7 +207,7 @@ def test_completions_stream_skips_chat_role_chunk(monkeypatch):
 
     response = client.post(
         "/v1/completions",
-        json={"model": "gpt-5.5", "prompt": "hello", "stream": True},
+        json={"model": "gpt-fixture-a", "prompt": "hello", "stream": True},
     )
 
     assert response.status_code == 200
@@ -245,7 +245,7 @@ def test_codex_image_generation_uses_image_tool(monkeypatch):
 
     async def _fake_codex_event_stream(payload):
         captured_payloads.append(payload)
-        yield {"type": "response.created", "response": {"id": "resp_test", "created_at": 123, "model": "gpt-5.5"}}
+        yield {"type": "response.created", "response": {"id": "resp_test", "created_at": 123, "model": "gpt-fixture-a"}}
         yield {
             "type": "response.output_item.done",
             "item": {
@@ -256,9 +256,9 @@ def test_codex_image_generation_uses_image_tool(monkeypatch):
                 "result": "Zm9v",
             },
         }
-        yield {"type": "response.completed", "response": {"id": "resp_test", "model": "gpt-5.5"}}
+        yield {"type": "response.completed", "response": {"id": "resp_test", "model": "gpt-fixture-a"}}
 
-    monkeypatch.setenv("CHATGPT_MEDIA_MODEL", "gpt-5.5")
+    monkeypatch.setenv("CHATGPT_MEDIA_MODEL", "gpt-fixture-a")
     bridge = ChatGPTBridge()
     monkeypatch.setattr(bridge, "_codex_event_stream_from_payload", _fake_codex_event_stream)
 
@@ -272,7 +272,7 @@ def test_codex_image_generation_uses_image_tool(monkeypatch):
     assert result["data"][0]["b64_json"] == "Zm9v"
     assert result["data"][0]["revised_prompt"] == "a small blue square"
     assert captured_payloads[0]["tools"] == [{"type": "image_generation", "output_format": "png"}]
-    assert captured_payloads[0]["model"] == "gpt-5.5"
+    assert captured_payloads[0]["model"] == "gpt-fixture-a"
 
 
 def test_audio_speech_route_returns_binary_audio(monkeypatch):

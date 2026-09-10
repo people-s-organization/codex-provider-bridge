@@ -207,10 +207,11 @@ class GenerationRequest(OpenAICompatModel):
 
     @model_validator(mode="after")
     def validate_compatibility(self):
-        if getattr(self, "previous_response_id", None) is not None:
-            raise ValueError("previous_response_id is unavailable; supply complete history")
-        if getattr(self, "store", None) is True:
-            raise ValueError("store=true is unavailable; the bridge does not persist responses")
+        previous_response_id = getattr(self, "previous_response_id", None)
+        if previous_response_id is not None and not str(previous_response_id).strip():
+            raise ValueError("previous_response_id must be a non-empty response id")
+        if hasattr(self, "input") and self.input is None and previous_response_id is None:
+            raise ValueError("input is required unless previous_response_id is supplied")
         if os.getenv("BRIDGE_STRICT_COMPATIBILITY", "").strip().lower() in {"1", "true", "yes", "on"}:
             warnings = self.compatibility_warnings()
             if warnings:
@@ -355,12 +356,24 @@ class ChatCompletionRequest(GenerationRequest):
     def validate_reasoning_effort(cls, value: Optional[str]) -> Optional[str]:
         return normalize_reasoning_effort(value)
 
+    def compatibility_warnings(self) -> List[str]:
+        warnings = super().compatibility_warnings()
+        # Chat completions are never retained by the bridge and the API exposes no
+        # retrieval route for them, so store=true cannot be honoured here.
+        if self.store is not None and self.store and "store" in self.model_fields_set:
+            warnings.append("store is ignored by the Codex bridge for chat completions")
+        return warnings
+
 
 class ResponsesRequest(GenerationRequest):
     model: str
-    input: Union[str, List[Dict[str, Any]]]
+    # Optional only when continuing a stored response, mirroring the real API's
+    # "input or previous_response_id" requirement.
+    input: Optional[Union[str, List[Dict[str, Any]]]] = None
     stream: Optional[bool] = False
-    store: Optional[bool] = False
+    # Matches the real Responses API default. Storage is bridge-local, bounded and
+    # in-memory; store=false opts out and makes previous_response_id unresolvable.
+    store: Optional[bool] = True
     instructions: Optional[str] = None
     text: Optional[Dict[str, Any]] = None
     reasoning: Optional[ReasoningConfig] = None
