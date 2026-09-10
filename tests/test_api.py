@@ -162,9 +162,10 @@ def test_chat_content_parts_are_converted_for_codex():
         )
     )
 
-    assert payload["instructions"] == "Be terse."
-    assert payload["input"][0]["content"][0] == {"type": "input_text", "text": "What is in this image?"}
-    assert payload["input"][0]["content"][1] == {
+    assert [item["role"] for item in payload["input"]] == ["system", "user"]
+    assert payload["input"][0]["content"] == [{"type": "input_text", "text": "Be terse."}]
+    assert payload["input"][1]["content"][0] == {"type": "input_text", "text": "What is in this image?"}
+    assert payload["input"][1]["content"][1] == {
         "type": "input_image",
         "image_url": "data:image/png;base64,AAA",
         "detail": "low",
@@ -331,7 +332,7 @@ def test_media_routes_report_missing_auth(monkeypatch):
     )
 
     assert response.status_code == 501
-    assert response.json()["error"]["message"].startswith("Media endpoints require auth")
+    assert response.json()["error"]["message"] == "Upstream request failed"
 
 
 def test_unimplemented_v1_route_explains_or_proxies(monkeypatch):

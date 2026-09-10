@@ -1,4 +1,14 @@
 import argparse
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import logging
+from functools import wraps
+from pathlib import Path
+import re
+import secrets
+import subprocess
+import uuid
 import html
 import json
 import socket
@@ -21,7 +31,126 @@ from schemas import (
 from bridge import bridge
 from auth import ensure_authenticated
 
-app = FastAPI(title="Codex Provider Bridge")
+STARTED_AT = datetime.now(timezone.utc).isoformat()
+
+
+def deployment_commit() -> str:
+    value = settings.deployment_commit
+    if not value:
+        try:
+            value = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent,
+                stderr=subprocess.DEVNULL, timeout=2, text=True,
+            ).strip()
+        except (OSError, subprocess.SubprocessError):
+            value = ""
+    return value if re.fullmatch(r"[0-9a-fA-F]{7,64}", value) else "unknown"
+
+
+DEPLOYMENT_COMMIT = deployment_commit()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    settings.validate_network_binding()
+    try:
+        yield
+    finally:
+        if hasattr(bridge, "aclose"):
+            await bridge.aclose()
+
+
+app = FastAPI(title="Codex Provider Bridge", lifespan=lifespan)
+
+
+class OperationalMiddleware:
+    """Bound bodies before parsing; keep capacity until streams close, not headers."""
+
+    def __init__(self, app):
+        self.app = app
+        self.active = 0
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        request_id = uuid.uuid4().hex  # Never reflect arbitrary client header values.
+        scope.setdefault("state", {})["request_id"] = request_id
+        started = False
+
+        async def send_with_id(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+                message["headers"] = [(k, v) for k, v in message.get("headers", []) if k.lower() != b"x-request-id"]
+                message["headers"].append((b"x-request-id", request_id.encode()))
+            await send(message)
+
+        async def reject(status, message, code):
+            await openai_error_response(status, message, code=code)(scope, receive, send_with_id)
+
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        health = scope["path"] == "/health" and scope["method"] in {"GET", "HEAD"}
+        if settings.bridge_api_key and not health:
+            supplied = headers.get(b"authorization", b"")
+            scheme, _, token = supplied.partition(b" ")
+            if scheme.lower() != b"bearer" or not secrets.compare_digest(token, settings.bridge_api_key.encode()):
+                return await reject(401, "Invalid bridge API key", "invalid_api_key")
+        if not health and self.active >= settings.max_concurrent_requests:
+            return await reject(429, "Bridge request capacity exceeded", "concurrency_limit")
+        if not health:
+            self.active += 1
+        try:
+            length = headers.get(b"content-length")
+            if length is not None:
+                try:
+                    length = int(length)
+                    if length < 0:
+                        raise ValueError
+                except ValueError:
+                    return await reject(400, "Invalid Content-Length", "invalid_request")
+                if length > settings.max_request_bytes:
+                    return await reject(413, "Request body is too large", "request_too_large")
+            chunks = []
+            size = 0
+            async with asyncio.timeout(settings.request_body_timeout_seconds):
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
+                    chunk = message.get("body", b"")
+                    size += len(chunk)
+                    if size > settings.max_request_bytes:
+                        return await reject(413, "Request body is too large", "request_too_large")
+                    chunks.append(chunk)
+                    if not message.get("more_body", False):
+                        break
+            delivered = False
+
+            async def replay():
+                nonlocal delivered
+                if not delivered:
+                    delivered = True
+                    return {"type": "http.request", "body": b"".join(chunks), "more_body": False}
+                return await receive()
+
+            await self.app(scope, replay, send_with_id)
+        except Exception as exc:
+            # Do not log exception strings: upstream errors may contain tokens or prompts.
+            logging.getLogger(__name__).warning("request_failed request_id=%s type=%s", request_id, type(exc).__name__)
+            if started:
+                # Headers/status are already committed; terminate without leaking traceback data.
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+                return
+            status = 504 if isinstance(exc, httpx.TimeoutException) else 408 if isinstance(exc, TimeoutError) else 502 if isinstance(exc, httpx.HTTPError) else 500
+            if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code <= 599:
+                status = exc.response.status_code
+            await reject(status, "Request timed out" if status in {408, 504} else "Request failed", "request_failed")
+        finally:
+            if not health:
+                self.active -= 1
+
+
+app.add_middleware(OperationalMiddleware)
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 WILDCARD_HOSTS = {"0.0.0.0", "::", ""}
 ACTIVE_HOST = settings.host
@@ -71,18 +200,22 @@ def openai_error_response(
 
 
 def upstream_error_to_response(error: dict, fallback_status: int = 502) -> JSONResponse:
-    status_code = int(error.get("status") or fallback_status)
-    message = str(error.get("error") or error.get("detail") or "Upstream request failed")
-    detail = error.get("detail")
-    if detail and detail != message:
-        message = f"{message}: {detail}"
-    return openai_error_response(
+    try:
+        status_code = int(error.get("status") or fallback_status)
+    except (TypeError, ValueError):
+        status_code = fallback_status
+    if not 400 <= status_code <= 599:
+        status_code = 502
+    response = openai_error_response(
         status_code=status_code,
-        message=message,
-        error_type=str(error.get("error_type") or error.get("type") or ("api_error" if status_code >= 500 else "invalid_request_error")),
-        param=error.get("param"),
-        code=error.get("code"),
+        message="Upstream request failed",
+        error_type="api_error" if status_code >= 500 else "invalid_request_error",
+        code="upstream_error",
     )
+    retry_after = str(error.get("retry_after", ""))
+    if re.fullmatch(r"[0-9]{1,6}", retry_after):
+        response.headers["Retry-After"] = retry_after
+    return response
 
 
 @app.exception_handler(HTTPException)
@@ -92,7 +225,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         return upstream_error_to_response(detail, exc.status_code)
     return openai_error_response(
         status_code=exc.status_code,
-        message=str(detail),
+        message="Request failed" if exc.status_code >= 500 else "Invalid request",
         error_type="api_error" if exc.status_code >= 500 else "invalid_request_error",
     )
 
@@ -102,9 +235,32 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     first_error = exc.errors()[0] if exc.errors() else {}
     loc = [str(part) for part in first_error.get("loc", []) if part != "body"]
     param = ".".join(loc) or None
+    # Only disclose known static validation messages, never arbitrary validator text.
+    message = str(first_error.get("msg", "")).removeprefix("Value error, ")
+    safe_messages = {
+        "Field required", "Input should be a valid string", "Input should be a valid boolean",
+        "model must be a non-empty model id",
+        "only client-executed function tools are supported; tool type must be function",
+        "tools and legacy functions cannot both be specified",
+        "tool_choice and function_call cannot both be specified",
+        "tool_choice names an undefined function",
+        "tool_choice required needs at least one function",
+        "tool_choice must be auto, none, required, or a named function",
+        "function call arguments must be a JSON object string",
+        "function calls require matching outputs before a new model turn",
+        "orphan or duplicate function call output",
+        "orphan legacy function result", "duplicate function call id",
+        "function name must contain 1-64 letters, digits, underscores or hyphens",
+        "function parameters must be a JSON Schema object",
+        "function parameters must describe an object",
+        "unsupported message role", "unsupported Responses message role",
+        "previous_response_id is unavailable; supply complete history",
+        "store=true is unavailable; the bridge does not persist responses",
+        "reasoning_effort must be one of: low, medium, high, xhigh (extra high)",
+    }
     return openai_error_response(
         status_code=422,
-        message=str(first_error.get("msg") or "Invalid request body"),
+        message=message if message in safe_messages else "Invalid request body",
         error_type="invalid_request_error",
         param=param,
         code="invalid_request",
@@ -255,9 +411,7 @@ async def home(request: Request):
             f" · <code>{escaped_cache_file}</code></p>"
         )
     else:
-        escaped_source_error = html.escape(
-            str(model_source_info.get("error") or "no configured model source returned any model")
-        )
+        escaped_source_error = "No configured model source returned any model"
         model_source_note = (
             "<p>No models available. Nothing is hard-coded in this bridge, so the list stays "
             f"empty until a real source reports models.<br />Source: <code>{escaped_source}</code>"
@@ -271,9 +425,10 @@ async def home(request: Request):
             f"({len(image_capability['tool_models'])} models advertise the image tool)</p>"
         )
     else:
+        image_state = "unknown" if image_capability["available"] is None else "not advertised"
         image_note = (
-            "<p>Image generation: <code>not advertised</code>"
-            f"<br />{html.escape(str(model_capabilities.get('error') or 'no capability source'))}</p>"
+            f"<p>Image generation: <code>{image_state}</code>"
+            "<br />No capability source is currently available</p>"
         )
     realtime_note = (
         "<p>Realtime speech: <code>no upstream listing</code>"
@@ -1076,24 +1231,12 @@ async def home(request: Request):
 
 @app.get("/health")
 async def health(request: Request):
-    access_urls = resolve_access_urls(
-        bind_host=ACTIVE_HOST,
-        port=resolve_request_port(request),
-        preferred_host=request.url.hostname,
-        scheme=request.url.scheme or "http",
-    )
-    snapshot = await run_in_threadpool(model_snapshot, include_capabilities=True)
+    # Public liveness must not perform model discovery or disclose paths/account data.
     return {
         "status": "ok",
         "service": app.title,
-        "listen": {
-            "host": ACTIVE_HOST,
-            "port": resolve_request_port(request),
-            "access_urls": access_urls,
-        },
-        "models": snapshot["model_ids"],
-        "model_source": snapshot["source"],
-        "capabilities": snapshot["capabilities"],
+        "deployment_commit": DEPLOYMENT_COMMIT,
+        "started_at": STARTED_AT,
     }
 
 
@@ -1188,7 +1331,21 @@ async def list_models():
     }
 
 
+def with_compatibility_warnings(handler):
+    @wraps(handler)
+    async def wrapped(request):
+        result = await handler(request)
+        warnings = request.compatibility_warnings() if hasattr(request, "compatibility_warnings") else []
+        if warnings:
+            if not isinstance(result, Response):
+                result = JSONResponse(content=result)
+            result.headers["X-Bridge-Compatibility-Warnings"] = "; ".join(warnings)
+        return result
+    return wrapped
+
+
 @app.post("/v1/responses")
+@with_compatibility_warnings
 async def responses(request: ResponsesRequest):
     if request.stream:
         return StreamingResponse(
@@ -1203,6 +1360,7 @@ async def responses(request: ResponsesRequest):
 
 
 @app.post("/v1/completions")
+@with_compatibility_warnings
 async def completions(request: CompletionRequest):
     if request.stream:
         return StreamingResponse(
@@ -1217,6 +1375,7 @@ async def completions(request: CompletionRequest):
 
 
 @app.post("/v1/chat/completions")
+@with_compatibility_warnings
 async def chat_completions(request: ChatCompletionRequest):
     if request.stream:
         return StreamingResponse(
@@ -1230,7 +1389,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         tool_calls = result.get("tool_calls") or None
         content = result["content"]
-        if tool_calls and not content:
+        if (tool_calls or result.get("function_call")) and not content:
             content = None
 
         return {
@@ -1246,9 +1405,9 @@ async def chat_completions(request: ChatCompletionRequest):
                         "content": content,
                         "refusal": None,
                         "tool_calls": tool_calls,
-                        "function_call": None,
+                        "function_call": result.get("function_call"),
                     },
-                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                    "finish_reason": result.get("finish_reason") or ("function_call" if result.get("function_call") else "tool_calls" if tool_calls else "stop"),
                     "logprobs": None,
                 }
             ],
@@ -1292,7 +1451,7 @@ async def proxy_or_explain_unimplemented_v1(path: str, request: Request):
     outbound_headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != "authorization"
+        if key.lower() in {"content-type", "accept", "openai-beta", "idempotency-key"}
     }
     outbound_headers["Authorization"] = f"Bearer {settings.openai_api_key}"
     outbound_headers.setdefault("User-Agent", "Codex Provider Bridge")
@@ -1307,6 +1466,9 @@ async def proxy_or_explain_unimplemented_v1(path: str, request: Request):
             headers=outbound_headers,
             content=body or None,
         )
+
+    if response.is_error:
+        return upstream_error_to_response({"status": response.status_code})
 
     response_headers = {
         key: value
@@ -1329,6 +1491,7 @@ async def proxy_or_explain_unimplemented_v1(path: str, request: Request):
 
 if __name__ == "__main__":
     args = parse_cli_args()
+    settings.validate_network_binding()
     # Ensure token exists or prompt user before starting the async loop
     ensure_authenticated(auth_method_override=args.auth)
     port = resolve_bind_port(settings.host, settings.port)

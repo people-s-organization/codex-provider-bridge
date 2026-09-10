@@ -15,6 +15,7 @@ import websockets
 from dotenv import load_dotenv
 
 from config import settings
+from upstream_transport import UpstreamTransport
 from model_registry import default_model_id, is_available_model, resolve_model_name
 from schemas import (
     AudioSpeechRequest,
@@ -27,119 +28,90 @@ from schemas import (
 
 
 class ToolCallAccumulator:
-    """Collects streamed Codex ``function_call`` items into OpenAI-shaped tool calls.
-
-    Upstream announces each call with ``response.output_item.added`` (carrying the id,
-    call_id and name), streams the arguments as ``response.function_call_arguments.delta``
-    and finishes with ``response.output_item.done`` holding the complete arguments.
-    """
+    """Compatibility wrapper for tool calls reconciled by EventAssembly."""
 
     def __init__(self) -> None:
-        self._calls: dict[str, dict[str, Any]] = {}
-        self._order: list[str] = []
+        from event_assembly import EventAssembly
+
+        self._assembly = EventAssembly()
+
+    def _call_for(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        item_id = (event.get("item") or {}).get("id") or event.get("item_id")
+        key = self._assembly.ids.get(item_id, event.get("output_index"))
+        item = self._assembly.items.get(key, {})
+        if item.get("type") != "function_call" or not item.get("call_id") or not item.get("name"):
+            return None
+        return {
+            "id": item["call_id"],
+            "type": "function",
+            "function": {"name": item["name"], "arguments": item.get("arguments", "")},
+        }
 
     def register(self, item: dict[str, Any]) -> dict[str, Any] | None:
         item_id = str(item.get("id") or "").strip()
         if not item_id:
             return None
-
-        call = self._calls.get(item_id)
-        if call is None:
-            call = {
-                "id": str(item.get("call_id") or "").strip() or f"call_{uuid.uuid4().hex}",
-                "type": "function",
-                "function": {
-                    "name": str(item.get("name") or "").strip(),
-                    "arguments": "",
-                },
-            }
-            self._calls[item_id] = call
-            self._order.append(item_id)
-        else:
-            if item.get("call_id"):
-                call["id"] = str(item["call_id"])
-            if item.get("name"):
-                call["function"]["name"] = str(item["name"])
-
-        arguments = item.get("arguments")
-        if isinstance(arguments, str) and arguments:
-            call["function"]["arguments"] = arguments
-
-        return call
+        event = {"type": "response.output_item.added", "item": {"type": "function_call", **item, "id": item_id}}
+        self._assembly.feed(event)
+        return self._call_for(event)
 
     def append_arguments(self, item_id: str, delta: str) -> dict[str, Any] | None:
         item_id = str(item_id or "").strip()
         if not item_id:
             return None
-
-        call = self._calls.get(item_id) or self.register({"id": item_id})
-        if call is None:
-            return None
-
-        call["function"]["arguments"] += delta
-        return call
+        event = {"type": "response.function_call_arguments.delta", "item_id": item_id, "delta": delta}
+        self._assembly.feed(event)
+        return self._call_for(event)
 
     def index_of(self, item_id: str) -> int:
         item_id = str(item_id or "").strip()
-        return self._order.index(item_id) if item_id in self._order else len(self._order)
+        items = self.as_output_items()
+        return next((index for index, item in enumerate(items) if item.get("id") == item_id), len(items))
 
     def __bool__(self) -> bool:
-        return bool(self._order)
+        return bool(self.as_tool_calls())
 
     def as_tool_calls(self) -> list[dict[str, Any]]:
-        return [self._calls[item_id] for item_id in self._order]
+        return self._assembly.calls()
 
     def as_output_items(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": item_id,
-                "type": "function_call",
-                "status": "completed",
-                "call_id": self._calls[item_id]["id"],
-                "name": self._calls[item_id]["function"]["name"],
-                "arguments": self._calls[item_id]["function"]["arguments"],
-            }
-            for item_id in self._order
-        ]
+        return [item for item in self._assembly.output() if item.get("type") == "function_call"]
 
     def handle_event(self, event: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
-        """Apply one upstream event.
-
-        Returns the affected call (if any) and a short action marker:
-        ``added``, ``arguments``, ``done`` or an empty string when nothing happened.
-        """
-
+        actions = {
+            "response.output_item.added": "added",
+            "response.output_item.done": "done",
+            "response.function_call_arguments.delta": "arguments",
+            "response.function_call_arguments.done": "done",
+        }
         event_type = event.get("type")
-
-        if event_type == "response.output_item.added":
-            item = event.get("item") or {}
-            if item.get("type") != "function_call":
-                return None, ""
-            return self.register(item), "added"
-
-        if event_type == "response.function_call_arguments.delta":
-            delta = event.get("delta") or ""
-            if not delta:
-                return None, ""
-            return self.append_arguments(str(event.get("item_id") or ""), str(delta)), "arguments"
-
-        if event_type == "response.output_item.done":
-            item = event.get("item") or {}
-            if item.get("type") != "function_call":
-                return None, ""
-            return self.register(item), "done"
-
-        return None, ""
+        if not self._assembly.feed(event):
+            return None, ""
+        action = actions.get(event_type, "")
+        if not action:
+            return None, ""
+        if event_type.startswith("response.output_item.") and (event.get("item") or {}).get("type") != "function_call":
+            return None, ""
+        if event_type == "response.function_call_arguments.delta" and not event.get("delta"):
+            return None, ""
+        return self._call_for(event), action
 
 
 class ChatGPTBridge:
     def __init__(self):
         self.base_url = settings.chatgpt_base_url.rstrip("/")
         self.openai_base_url = settings.openai_base_url.rstrip("/")
+        self._transport = UpstreamTransport()
+
+    async def aclose(self):
+        await self._transport.aclose()
 
     def _build_headers(self) -> dict[str, str]:
+        from runtime_credentials import access_token
+
+        token = access_token(settings.chatgpt_access_token)
         return {
-            "Authorization": f"Bearer {settings.chatgpt_access_token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
             "User-Agent": "codex_cli_rs/0.0.0 (Codex Provider Bridge)",
@@ -334,58 +306,41 @@ class ChatGPTBridge:
         return items or [{"type": text_type, "text": ""}]
 
     def _normalize_responses_input_items(self, request_input: Any) -> Any:
-        """Fix content part types and drop unpaired tool outputs on ``/v1/responses`` input.
+        """Validate complete replay without demoting roles or losing opaque metadata."""
 
-        Two upstream rules are enforced here:
+        from copy import deepcopy
+        from schemas import validate_response_history
 
-        * message content is retyped per role (assistant turns only accept ``output_text``
-          / ``refusal``, user turns only accept ``input_text`` / ``input_image``);
-        * a ``function_call_output`` is only sent when a ``function_call`` with the same
-          ``call_id`` appeared earlier in the same input, because the backend rejects an
-          orphan output with ``No tool call found for function call output``.
-
-        Unpaired outputs degrade to a plain user text turn; other item types pass through
-        untouched.
-        """
-
-        if not isinstance(request_input, list):
+        if isinstance(request_input, str):
             return request_input
-
+        if not isinstance(request_input, list) or any(not isinstance(item, dict) for item in request_input):
+            raise ValueError("Responses input must be text or an array of objects")
+        validate_response_history(request_input)
+        request_input = deepcopy(request_input)
         normalized: list[Any] = []
-        known_call_ids: set[str] = set()
-
         for item in request_input:
-            if not isinstance(item, dict):
-                normalized.append(item)
-                continue
-
-            item_type = str(item.get("type") or "").strip()
-            if item_type == "function_call":
-                call_id = str(item.get("call_id") or item.get("id") or "").strip()
-                if call_id:
-                    known_call_ids.add(call_id)
-                normalized.append(item)
-                continue
-
-            if item_type == "function_call_output":
-                call_id = str(item.get("call_id") or "").strip()
-                if call_id and call_id in known_call_ids:
-                    normalized.append(item)
-                else:
-                    normalized.append(self._tool_result_message(item.get("output"), call_id))
-                continue
-
-            role = str(item.get("role") or "").strip().lower()
+            role = item.get("role")
             if role not in {"user", "assistant", "system", "developer"} or "content" not in item:
                 normalized.append(item)
                 continue
 
-            if role in {"system", "developer"}:
-                role = "user"
-
             normalized_item = dict(item)
             normalized_item["role"] = role
-            normalized_item["content"] = self._content_to_codex_items(item.get("content"), role)
+            content = item.get("content")
+            native = {"output_text", "refusal"} if role == "assistant" else {"input_text", "input_image"}
+            if isinstance(content, list) and all(isinstance(p, dict) and p.get("type") in native for p in content):
+                normalized_item["content"] = content
+            else:
+                parts = content if isinstance(content, list) else [content]
+                converted = []
+                for part in parts:
+                    if isinstance(part, dict) and part.get("type") in native:
+                        converted.append(part)
+                    elif isinstance(part, dict) and part.get("type") in {"text", "input_text", "output_text"} and "text" in part:
+                        converted.append({**part, "type": "output_text" if role == "assistant" else "input_text"})
+                    else:
+                        converted.extend(self._content_to_codex_items(part, role))
+                normalized_item["content"] = converted
             normalized.append(normalized_item)
 
         return normalized
@@ -407,73 +362,50 @@ class ChatGPTBridge:
 
         Replaying the call is what makes the later ``function_call_output`` valid; the
         Codex backend accepts the pair (verified) but rejects the output on its own.
-        Calls without an id cannot be paired, so they are not emitted.
+        Malformed calls are rejected rather than invented or silently omitted.
         """
 
+        from schemas import validate_call
+
         if not isinstance(tool_calls, list):
-            return []
-
-        items: list[dict[str, Any]] = []
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-
-            call_id = str(tool_call.get("id") or tool_call.get("call_id") or "").strip()
-            if not call_id:
-                continue
-
-            function = tool_call.get("function")
-            if not isinstance(function, dict):
-                function = {}
-
-            name = str(function.get("name") or tool_call.get("name") or "").strip() or "unknown_function"
-            arguments = function.get("arguments", tool_call.get("arguments"))
-            if isinstance(arguments, (dict, list)):
-                arguments = json.dumps(arguments, ensure_ascii=False)
-
-            items.append(
-                {
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments if isinstance(arguments, str) else "",
-                }
-            )
-
+            raise ValueError("assistant tool_calls must be an array")
+        items = []
+        seen = set()
+        for call in tool_calls:
+            if not isinstance(call, dict) or call.get("type") != "function" or not isinstance(call.get("function"), dict):
+                raise ValueError("assistant tool_calls must contain function objects")
+            function = call["function"]
+            item = {"type": "function_call", "call_id": call.get("id"), "name": function.get("name"), "arguments": function.get("arguments")}
+            validate_call(item)
+            if item["call_id"] in seen:
+                raise ValueError("duplicate function call id")
+            seen.add(item["call_id"])
+            items.append(item)
         return items
 
     def _message_to_response_input_items(
         self, message: Message, known_call_ids: set[str]
     ) -> list[dict[str, Any]]:
+        if message.role == "function" or message.function_call is not None:
+            raise ValueError("legacy replay requires full history normalization")
         if message.role == "tool":
             output = self._stringify_content(message.content)
-            call_id = str(message.tool_call_id or "").strip()
-            if call_id and call_id in known_call_ids:
-                return [
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": output or "(tool returned no output)",
-                    }
-                ]
-            return [self._tool_result_message(output, call_id)]
+            call_id = message.tool_call_id
+            if not call_id or call_id not in known_call_ids:
+                raise ValueError("orphan or duplicate tool result")
+            known_call_ids.remove(call_id)
+            return [{"type": "function_call_output", "call_id": call_id, "output": output}]
 
-        role = "assistant" if message.role == "assistant" else "user"
+        role = message.role
+        if role not in {"assistant", "user", "system", "developer"}:
+            raise ValueError("unsupported message role")
         content = self._content_to_codex_items(message.content, role)
         items: list[dict[str, Any]] = []
 
         if role == "assistant" and message.tool_calls:
             call_items = self._assistant_tool_call_items(message.tool_calls)
-            if not call_items:
-                content.append(
-                    {
-                        "type": "output_text",
-                        "text": (
-                            "[assistant tool_calls omitted: OpenAI tool calling is not exposed "
-                            "by the Codex backend bridge]"
-                        ),
-                    }
-                )
+            if any(item["call_id"] in known_call_ids for item in call_items):
+                raise ValueError("duplicate function call id")
             if content:
                 items.append({"type": "message", "role": role, "content": content})
             items.extend(call_items)
@@ -485,86 +417,30 @@ class ChatGPTBridge:
         return items
 
     def _extract_instructions_and_input(self, messages) -> tuple[str | None, list[dict[str, Any]]]:
-        instructions = []
-        input_items: list[dict[str, Any]] = []
-        known_call_ids: set[str] = set()
+        from schemas import chat_history_items
 
-        for message in messages:
-            if message.role in {"system", "developer"}:
-                instruction = self._stringify_content(message.content)
-                if instruction:
-                    instructions.append(instruction)
-                continue
-
-            input_items.extend(self._message_to_response_input_items(message, known_call_ids))
-
-        compiled_instructions = "\n\n".join(part for part in instructions if part).strip() or None
-        return compiled_instructions, input_items
+        # Keep instruction messages ordered and role-separated; never demote them.
+        return None, self._normalize_responses_input_items(chat_history_items(messages))
 
     def _normalize_tool_definitions(self, tools: Any) -> tuple[list[dict[str, Any]], list[str]]:
         """Flatten OpenAI tool definitions into the Codex responses shape.
 
         Chat Completions nests the definition under ``function``; the Responses API and
         the Codex backend both use the flat ``{type, name, description, parameters}``
-        shape. Only ``function`` tools are forwarded; other tool types are reported back
-        so callers can tell the model they were dropped.
+        shape. Only client-executed ``function`` tools are supported; all other types
+        fail validation explicitly.
         """
 
-        forwarded: list[dict[str, Any]] = []
-        dropped_types: list[str] = []
+        from schemas import normalize_tools
 
-        for tool in tools or []:
-            if not isinstance(tool, dict):
-                continue
-
-            tool_type = str(tool.get("type") or "function").strip() or "function"
-            if tool_type != "function":
-                if tool_type not in dropped_types:
-                    dropped_types.append(tool_type)
-                continue
-
-            function = tool.get("function")
-            source = function if isinstance(function, dict) else tool
-
-            name = str(source.get("name") or "").strip()
-            if not name:
-                continue
-
-            definition: dict[str, Any] = {"type": "function", "name": name}
-            description = source.get("description")
-            if description:
-                definition["description"] = str(description)
-            parameters = source.get("parameters")
-            if isinstance(parameters, dict):
-                definition["parameters"] = parameters
-            if source.get("strict") is not None:
-                definition["strict"] = bool(source.get("strict"))
-
-            forwarded.append(definition)
-
-        return forwarded, dropped_types
+        return normalize_tools(tools), []
 
     def _normalize_tool_choice(self, tool_choice: Any, function_call: Any = None) -> Any:
         """Map Chat Completions / Responses tool_choice onto the Codex shape."""
 
-        choice = tool_choice if tool_choice is not None else function_call
-        if choice is None:
-            return None
+        from schemas import normalize_choice
 
-        if isinstance(choice, str):
-            value = choice.strip().lower()
-            return value if value in {"auto", "none", "required"} else None
-
-        if isinstance(choice, dict):
-            function = choice.get("function")
-            name = ""
-            if isinstance(function, dict):
-                name = str(function.get("name") or "").strip()
-            name = name or str(choice.get("name") or "").strip()
-            if name:
-                return {"type": "function", "name": name}
-
-        return None
+        return normalize_choice(tool_choice, function_call)
 
     def _apply_tools(
         self,
@@ -578,26 +454,23 @@ class ChatGPTBridge:
     ) -> str:
         """Attach forwarded tools to an upstream payload, returning final instructions."""
 
-        combined = list(tools or []) + list(legacy_functions or [])
-        forwarded, dropped_types = self._normalize_tool_definitions(combined)
-
+        if tools is not None and legacy_functions is not None:
+            raise ValueError("tools and legacy functions cannot both be specified")
+        combined = tools if tools is not None else [{"type": "function", "function": f} for f in (legacy_functions or [])]
+        forwarded, _ = self._normalize_tool_definitions(combined)
+        choice = self._normalize_tool_choice(tool_choice, function_call)
+        if isinstance(choice, dict) and choice["name"] not in {t["name"] for t in forwarded}:
+            raise ValueError("tool_choice names an undefined function")
+        if choice == "required" and not forwarded:
+            raise ValueError("tool_choice required needs at least one function")
+        if parallel_tool_calls is not None and not isinstance(parallel_tool_calls, bool):
+            raise ValueError("parallel_tool_calls must be a boolean")
         if forwarded:
             payload["tools"] = forwarded
-            normalized_choice = self._normalize_tool_choice(tool_choice, function_call)
-            if normalized_choice is not None:
-                payload["tool_choice"] = normalized_choice
-            if parallel_tool_calls is not None:
-                payload["parallel_tool_calls"] = bool(parallel_tool_calls)
-            return instructions
-
-        if dropped_types:
-            note = (
-                "Compatibility note: only function tools can be forwarded, so these tool "
-                f"types were dropped: {', '.join(dropped_types)}. Answer directly and do "
-                "not claim to have executed any tool."
-            )
-            return f"{instructions}\n\n{note}" if instructions else note
-
+        if choice is not None:
+            payload["tool_choice"] = choice
+        if parallel_tool_calls is not None:
+            payload["parallel_tool_calls"] = parallel_tool_calls
         return instructions
 
     def _unsupported_chat_options_error(self, request: ChatCompletionRequest) -> dict[str, Any] | None:
@@ -657,16 +530,15 @@ class ChatGPTBridge:
         )
 
         tool_payload: dict[str, Any] = {}
-        if request.tools or request.functions:
-            instructions = self._apply_tools(
-                tool_payload,
-                instructions,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-                function_call=request.function_call,
-                legacy_functions=request.functions,
-                parallel_tool_calls=request.parallel_tool_calls,
-            )
+        instructions = self._apply_tools(
+            tool_payload,
+            instructions,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            function_call=request.function_call,
+            legacy_functions=request.functions,
+            parallel_tool_calls=request.parallel_tool_calls,
+        )
 
         payload: dict[str, Any] = {
             "model": self._resolve_model_name(request.model),
@@ -726,14 +598,13 @@ class ChatGPTBridge:
             request.text.get("format") if isinstance(request.text, dict) else None,
         )
         tool_payload: dict[str, Any] = {}
-        if request.tools:
-            instructions = self._apply_tools(
-                tool_payload,
-                instructions,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-                parallel_tool_calls=request.parallel_tool_calls,
-            )
+        instructions = self._apply_tools(
+            tool_payload,
+            instructions,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+        )
 
         payload: dict[str, Any] = {
             "model": self._resolve_model_name(request.model),
@@ -792,43 +663,11 @@ class ChatGPTBridge:
     async def _codex_event_stream_from_payload(
         self, payload: dict[str, Any]
     ) -> AsyncGenerator[dict[str, Any], None]:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/backend-api/codex/responses",
-                headers=self._build_headers(),
-                json=payload,
-            ) as response:
-                if response.status_code != 200:
-                    error_detail = await response.aread()
-                    yield {
-                        "type": "error",
-                        "error": "Failed to connect to ChatGPT",
-                        "detail": error_detail.decode(),
-                    }
-                    return
-
-                current_event = None
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-
-                    if line.startswith("event: "):
-                        current_event = line[7:]
-                        continue
-
-                    if not line.startswith("data: "):
-                        continue
-
-                    try:
-                        event = json.loads(line[6:])
-                    except json.JSONDecodeError:
-                        continue
-
-                    if "type" not in event and current_event:
-                        event["type"] = current_event
-
-                    yield event
+        async for event in self._transport.events(
+            f"{self.base_url}/backend-api/codex/responses",
+            self._build_headers(), payload,
+        ):
+            yield event
 
     async def _codex_event_stream(
         self, request: ChatCompletionRequest
@@ -844,290 +683,28 @@ class ChatGPTBridge:
     async def chat_completion(
         self, request: ChatCompletionRequest
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        full_text = []
-        tool_calls = ToolCallAccumulator()
-        response_id = f"chatcmpl-{uuid.uuid4()}"
-        created = int(time.time())
-        usage = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        }
+        from event_adapters import chat_completion
 
-        async for event in self._codex_event_stream(request):
-            event_type = event.get("type")
-
-            if event_type == "error":
-                return None, event
-
-            if event_type == "response.created":
-                response = event.get("response", {})
-                response_id = response.get("id", response_id)
-                created = response.get("created_at", created)
-                continue
-
-            if event_type == "response.output_text.delta":
-                delta = event.get("delta", "")
-                if delta:
-                    full_text.append(delta)
-                continue
-
-            if event_type in {
-                "response.output_item.added",
-                "response.output_item.done",
-                "response.function_call_arguments.delta",
-            }:
-                tool_calls.handle_event(event)
-                continue
-
-            if event_type == "response.completed":
-                response = event.get("response", {})
-                usage = self._usage_from_response(response)
-                return (
-                    {
-                        "id": response_id,
-                        "created": created,
-                        "model": request.model,
-                        "content": "".join(full_text),
-                        "tool_calls": tool_calls.as_tool_calls(),
-                        "usage": usage,
-                    },
-                    None,
-                )
-
-        return (
-            {
-                "id": response_id,
-                "created": created,
-                "model": request.model,
-                "content": "".join(full_text),
-                "tool_calls": tool_calls.as_tool_calls(),
-                "usage": usage,
-            },
-            None,
-        )
+        return await chat_completion(self, request)
 
     async def chat_completion_stream(
         self, request: ChatCompletionRequest
     ) -> AsyncGenerator[str, None]:
-        response_id = f"chatcmpl-{uuid.uuid4()}"
-        created = int(time.time())
-        include_usage = bool((request.stream_options or {}).get("include_usage"))
-        sent_role = False
-        tool_calls = ToolCallAccumulator()
+        from event_adapters import chat_completion_stream
 
-        async for event in self._codex_event_stream(request):
-            event_type = event.get("type")
-
-            if event_type == "error":
-                yield f"data: {json.dumps({'error': event})}\n\n"
-                return
-
-            if event_type == "response.created":
-                response = event.get("response", {})
-                response_id = response.get("id", response_id)
-                created = response.get("created_at", created)
-                chunk = self._chat_stream_chunk(
-                    response_id=response_id,
-                    created=created,
-                    model=request.model,
-                    delta={"role": "assistant"},
-                    include_usage=include_usage,
-                )
-                yield f"data: {json.dumps(chunk)}\n\n"
-                sent_role = True
-                continue
-
-            if event_type == "response.output_text.delta":
-                delta = event.get("delta", "")
-                if not delta:
-                    continue
-
-                if not sent_role:
-                    role_chunk = self._chat_stream_chunk(
-                        response_id=response_id,
-                        created=created,
-                        model=request.model,
-                        delta={"role": "assistant"},
-                        include_usage=include_usage,
-                    )
-                    yield f"data: {json.dumps(role_chunk)}\n\n"
-                    sent_role = True
-
-                chunk = self._chat_stream_chunk(
-                    response_id=response_id,
-                    created=created,
-                    model=request.model,
-                    delta={"content": delta},
-                    include_usage=include_usage,
-                )
-                yield f"data: {json.dumps(chunk)}\n\n"
-                continue
-
-            if event_type in {
-                "response.output_item.added",
-                "response.output_item.done",
-                "response.function_call_arguments.delta",
-            }:
-                call, action = tool_calls.handle_event(event)
-                if call is None or action == "done":
-                    continue
-
-                if not sent_role:
-                    role_chunk = self._chat_stream_chunk(
-                        response_id=response_id,
-                        created=created,
-                        model=request.model,
-                        delta={"role": "assistant"},
-                        include_usage=include_usage,
-                    )
-                    yield f"data: {json.dumps(role_chunk)}\n\n"
-                    sent_role = True
-
-                index = tool_calls.index_of(str(event.get("item_id") or (event.get("item") or {}).get("id") or ""))
-                if action == "added":
-                    tool_delta = {
-                        "index": index,
-                        "id": call["id"],
-                        "type": "function",
-                        "function": {"name": call["function"]["name"], "arguments": ""},
-                    }
-                else:
-                    tool_delta = {
-                        "index": index,
-                        "function": {"arguments": str(event.get("delta") or "")},
-                    }
-
-                chunk = self._chat_stream_chunk(
-                    response_id=response_id,
-                    created=created,
-                    model=request.model,
-                    delta={"tool_calls": [tool_delta]},
-                    include_usage=include_usage,
-                )
-                yield f"data: {json.dumps(chunk)}\n\n"
-                continue
-
-            if event_type == "response.completed":
-                response = event.get("response", {})
-                usage = self._usage_from_response(response)
-                if not sent_role:
-                    role_chunk = self._chat_stream_chunk(
-                        response_id=response_id,
-                        created=created,
-                        model=request.model,
-                        delta={"role": "assistant"},
-                        include_usage=include_usage,
-                    )
-                    yield f"data: {json.dumps(role_chunk)}\n\n"
-                chunk = self._chat_stream_chunk(
-                    response_id=response_id,
-                    created=created,
-                    model=request.model,
-                    delta={},
-                    finish_reason="tool_calls" if tool_calls else "stop",
-                    include_usage=include_usage,
-                )
-                yield f"data: {json.dumps(chunk)}\n\n"
-                if include_usage:
-                    usage_chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": request.model,
-                        "choices": [],
-                        "usage": usage,
-                    }
-                    yield f"data: {json.dumps(usage_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
+        async for chunk in chat_completion_stream(self, request):
+            yield chunk
 
     async def responses(self, request: ResponsesRequest) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        response_id = f"resp_{uuid.uuid4().hex}"
-        created = int(time.time())
-        full_text: list[str] = []
-        tool_calls = ToolCallAccumulator()
-        usage = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-        }
+        from event_adapters import responses
 
-        async for event in self._codex_event_stream_from_payload(self._build_responses_payload(request)):
-            event_type = event.get("type")
-
-            if event_type == "error":
-                return None, event
-
-            if event_type == "response.created":
-                response = event.get("response", {})
-                response_id = response.get("id", response_id)
-                created = response.get("created_at", created)
-                continue
-
-            if event_type == "response.output_text.delta":
-                delta = event.get("delta", "")
-                if delta:
-                    full_text.append(delta)
-                continue
-
-            if event_type in {
-                "response.output_item.added",
-                "response.output_item.done",
-                "response.function_call_arguments.delta",
-            }:
-                tool_calls.handle_event(event)
-                continue
-
-            if event_type == "response.completed":
-                response = event.get("response", {})
-                raw_usage = response.get("usage") or {}
-                usage = {
-                    "input_tokens": raw_usage.get("input_tokens", 0),
-                    "output_tokens": raw_usage.get("output_tokens", 0),
-                    "total_tokens": raw_usage.get("total_tokens", 0),
-                }
-
-        output_text = "".join(full_text)
-        output: list[dict[str, Any]] = []
-        if output_text:
-            output.append(
-                {
-                    "id": f"msg_{uuid.uuid4().hex}",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": output_text,
-                            "annotations": [],
-                        }
-                    ],
-                }
-            )
-        output.extend(tool_calls.as_output_items())
-
-        return (
-            {
-                "id": response_id,
-                "object": "response",
-                "created_at": created,
-                "status": "completed",
-                "model": request.model,
-                "output_text": output_text,
-                "output": output,
-                "usage": usage,
-            },
-            None,
-        )
+        return await responses(self, request)
 
     async def responses_stream(self, request: ResponsesRequest) -> AsyncGenerator[str, None]:
-        async for event in self._codex_event_stream_from_payload(self._build_responses_payload(request)):
-            event_type = event.get("type") or "response.event"
-            if event_type == "error":
-                yield f"event: error\ndata: {json.dumps(event)}\n\n"
-                return
-            yield f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
+        from event_adapters import responses_stream
+
+        async for chunk in responses_stream(self, request):
+            yield chunk
 
     def _completion_prompts(self, prompt: Any) -> list[str]:
         if prompt is None:
@@ -1421,7 +998,13 @@ class ChatGPTBridge:
         }
         if response_id:
             result["id"] = response_id
-        result["model"] = request.model
+        result["requested_model"] = request.model
+        result["model"] = response_model
+        result["image_model"] = None  # The tool does not disclose its underlying model ID.
+        result["warnings"] = [
+            "Image generation used the Codex image_generation tool; model identifies "
+            "the driver, not a verified image model. requested_model is only the request label."
+        ]
         if response_model:
             result["codex_model"] = response_model
         return result, None

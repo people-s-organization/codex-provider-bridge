@@ -1,3 +1,8 @@
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -16,12 +21,16 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def reset_upstream_cache():
-    model_registry._fetch_cache.update({"at": 0.0, "ids": [], "error": None})
-    model_registry._capabilities_cache.update({"at": 0.0, "payload": None, "error": None})
+def reset_upstream_cache(monkeypatch):
+    monkeypatch.setenv("CHATGPT_CLIENT_VERSION", "")
+    monkeypatch.setenv("CHATGPT_CODEX_EXECUTABLE", "")
+    model_registry._fetch_cache.clear()
+    model_registry._capabilities_cache.clear()
+    model_registry._installed_codex_version.cache_clear()
     yield
-    model_registry._fetch_cache.update({"at": 0.0, "ids": [], "error": None})
-    model_registry._capabilities_cache.update({"at": 0.0, "payload": None, "error": None})
+    model_registry._fetch_cache.clear()
+    model_registry._capabilities_cache.clear()
+    model_registry._installed_codex_version.cache_clear()
 
 
 def _missing_cache(monkeypatch, tmp_path):
@@ -195,17 +204,21 @@ def test_capabilities_report_image_tool_models(monkeypatch):
     caps = model_registry.capabilities()
 
     assert caps["source"] == "chatgpt_models"
-    assert caps["image_generation"] == {"available": True, "tool_models": ["gpt-a", "gpt-b"]}
+    assert caps["image_generation"]["available"] is True
+    assert caps["image_generation"]["tool_models"] == ["gpt-a", "gpt-b"]
+    assert caps["image_generation"]["status"] == "available"
     assert caps["realtime_speech"]["model_listing"] is False
     assert caps["tool_calling"]["available"] is True
     assert caps["tool_calling"]["scope"] == "bridge"
 
 
-def test_capabilities_without_a_source_report_unavailable():
+def test_capabilities_without_a_source_report_unknown():
     caps = model_registry.capabilities()
 
     assert caps["source"] == "none"
-    assert caps["image_generation"] == {"available": False, "tool_models": []}
+    assert caps["image_generation"]["available"] is None
+    assert caps["image_generation"]["status"] == "unknown"
+    assert caps["image_generation"]["tool_models"] == []
     assert caps["tool_calling"]["available"] is True
     assert caps["error"]
 
@@ -276,3 +289,224 @@ def test_realtime_model_prefers_configured_model(monkeypatch):
     request = AudioSpeechRequest(model="tts-explicit", input="hello")
 
     assert bridge._resolve_realtime_model(request) == "gpt-fixture-b"
+
+
+def _mock_listing(monkeypatch, payload=None, status=200, callback=None):
+    calls = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            if callback:
+                callback()
+            return SimpleNamespace(status_code=status, json=lambda: payload)
+
+    monkeypatch.setattr(model_registry.httpx, "Client", Client)
+    monkeypatch.setenv("CHATGPT_ACCESS_TOKEN", "token-one")
+    monkeypatch.setenv("CHATGPT_MODELS_URL", "https://one.test/models")
+    monkeypatch.setenv("CHATGPT_CAPABILITIES_URL", "https://one.test/capabilities")
+    return calls
+
+
+def test_missing_cache_discovers_installed_codex_version(monkeypatch, tmp_path):
+    _missing_cache(monkeypatch, tmp_path)
+    monkeypatch.delenv("CHATGPT_CLIENT_VERSION", raising=False)
+    executable = tmp_path / "codex"
+    executable.write_text("fixture")
+    monkeypatch.setattr(model_registry.shutil, "which", lambda name: str(executable))
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(stdout="codex-cli 0.134.1\n")
+
+    monkeypatch.setattr(model_registry.subprocess, "run", run)
+    calls = _mock_listing(monkeypatch, {"models": [{"slug": "live"}]})
+    assert model_registry.available_model_ids() == ["live"]
+    assert commands == [[str(executable), "--version"]]
+    assert calls[0][1]["params"] == {"client_version": "0.134.1"}
+    assert calls[0][1]["headers"]["version"] == "0.134.1"
+
+
+def test_installed_codex_local_bin_discovery_without_path(monkeypatch, tmp_path):
+    _missing_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("CHATGPT_CLIENT_VERSION", "")
+    monkeypatch.setattr(model_registry.shutil, "which", lambda name: None)
+    monkeypatch.setattr(model_registry.Path, "home", lambda: tmp_path)
+    executable = tmp_path / ".local/bin/codex"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("fixture")
+    monkeypatch.setattr(model_registry.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout="codex-cli 0.154.0"))
+    assert model_registry._client_version() == "0.154.0"
+
+
+def test_missing_version_reports_actionable_error_without_fake_request(monkeypatch, tmp_path):
+    _missing_cache(monkeypatch, tmp_path)
+    monkeypatch.delenv("CHATGPT_CLIENT_VERSION", raising=False)
+    monkeypatch.setattr(model_registry.shutil, "which", lambda name: None)
+    monkeypatch.setenv("CHATGPT_CODEX_EXECUTABLE", str(tmp_path / "missing-codex"))
+    calls = _mock_listing(monkeypatch, {"models": [{"slug": "live"}]})
+    assert model_registry.available_model_ids() == []
+    assert "client_version" in model_registry.model_source()["error"]
+    assert not calls
+
+
+def test_version_override_and_codex_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("CHATGPT_MODELS_FILE", "")
+    monkeypatch.setenv("CHATGPT_CODEX_CONFIG_FILE", "")
+    (tmp_path / "models_cache.json").write_text(json.dumps({"models": ["one", "two"]}))
+    (tmp_path / "config.toml").write_text('model = "two"')
+    monkeypatch.setenv("CHATGPT_CLIENT_VERSION", "1.2.3")
+    assert model_registry.available_model_ids() == ["two", "one"]
+    assert model_registry._client_version() == "1.2.3"
+
+
+@pytest.mark.parametrize("source", ["env", "codex"])
+def test_defaults_do_not_fabricate_models(monkeypatch, tmp_path, source):
+    if source == "env":
+        monkeypatch.setenv("CHATGPT_DEFAULT_MODEL", "unavailable")
+    else:
+        config = tmp_path / "config.toml"
+        config.write_text('model = "unavailable"')
+        monkeypatch.setenv("CHATGPT_CODEX_CONFIG_FILE", str(config))
+    assert model_registry.available_model_ids() == ["gpt-fixture-a", "gpt-fixture-b"]
+    _missing_cache(monkeypatch, tmp_path)
+    assert model_registry.available_model_ids() == []
+
+
+@pytest.mark.parametrize("kind", ["models", "capabilities"])
+@pytest.mark.parametrize("changed", ["CHATGPT_ACCOUNT_ID", "CHATGPT_ACCESS_TOKEN", "url"])
+def test_fetch_caches_are_identity_keyed(monkeypatch, tmp_path, kind, changed):
+    _empty_cache(monkeypatch, tmp_path)
+    calls = _mock_listing(monkeypatch, {"models": [{"slug": "live", "enabled_tools": []}]})
+    fetch = model_registry.available_model_ids if kind == "models" else model_registry.capabilities
+    fetch()
+    fetch()
+    assert len(calls) == 1
+    variable = ("CHATGPT_MODELS_URL" if kind == "models" else "CHATGPT_CAPABILITIES_URL") if changed == "url" else changed
+    monkeypatch.setenv(variable, "https://two.test/list" if changed == "url" else "identity-two")
+    fetch()
+    assert len(calls) == 2
+
+
+def test_refresh_bypasses_disk_and_ttl_without_duplicate_snapshot_fetch(monkeypatch):
+    calls = _mock_listing(monkeypatch, {"models": [{"slug": "live"}]})
+    assert model_registry.model_snapshot()["source"]["source"] == "models_cache"
+    snapshot = model_registry.model_snapshot(refresh=True)
+    assert snapshot["model_ids"] == ["live"]
+    assert snapshot["source"]["source"] == "upstream"
+    assert len(calls) == 1
+    model_registry.model_snapshot(refresh=True)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("kind", ["models", "capabilities"])
+def test_concurrent_fetches_coalesce(monkeypatch, tmp_path, kind):
+    _empty_cache(monkeypatch, tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    waiter = threading.Event()
+    original_result = model_registry.Future.result
+
+    def result(self, *args, **kwargs):
+        waiter.set()
+        return original_result(self, *args, **kwargs)
+
+    monkeypatch.setattr(model_registry.Future, "result", result)
+
+    def block():
+        entered.set()
+        assert release.wait(5)
+
+    calls = _mock_listing(monkeypatch, {"models": [{"slug": "live", "enabled_tools": []}]}, callback=block)
+    fetch = model_registry.available_model_ids if kind == "models" else model_registry.capabilities
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(fetch, refresh=True)
+        assert entered.wait(5)
+        second = pool.submit(fetch, refresh=True)
+        try:
+            assert waiter.wait(5)
+        finally:
+            release.set()
+        assert first.result() == second.result()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("payload,status,expected", [
+    ({"models": [{"slug": "one", "enabled_tools": []}]}, 200, "unsupported"),
+    ({"models": [{"slug": "one"}]}, 200, "unknown"),
+    ({"models": []}, 200, "unknown"),
+    ({"unexpected": []}, 200, "unknown"),
+    ({"models": []}, 403, "unknown"),
+])
+def test_capability_unknown_is_not_unsupported(monkeypatch, payload, status, expected):
+    calls = _mock_listing(monkeypatch, payload, status)
+    caps = model_registry.capabilities()
+    assert caps["image_generation"]["status"] == expected
+    assert caps["image_generation"]["available"] is (False if expected == "unsupported" else None)
+    assert caps["realtime_speech"]["available"] is None
+    assert caps["tool_calling"]["upstream_supports_function_tools"] is None
+    model_registry.capabilities(refresh=True)
+    assert len(calls) == 2
+
+
+def test_cache_ttl_starts_when_fetch_completes(monkeypatch, tmp_path):
+    _empty_cache(monkeypatch, tmp_path)
+    clock = [0.0]
+    monkeypatch.setattr(model_registry.time, "monotonic", lambda: clock[0])
+    calls = _mock_listing(monkeypatch, {"models": ["live"]}, callback=lambda: clock.__setitem__(0, 100.0))
+    assert model_registry.available_model_ids() == ["live"]
+    clock[0] = 110.0
+    assert model_registry.available_model_ids() == ["live"]
+    assert len(calls) == 1
+    clock[0] = 161.0
+    model_registry.available_model_ids()
+    assert len(calls) == 2
+
+
+def test_expired_disk_cache_refreshes_on_ordinary_snapshot(monkeypatch):
+    calls = _mock_listing(monkeypatch, {"models": ["fresh-live"]})
+    written = model_registry._models_cache_path().stat().st_mtime
+    monkeypatch.setattr(model_registry.time, "time", lambda: written + 61)
+    snapshot = model_registry.model_snapshot()
+    assert snapshot["model_ids"] == ["fresh-live"]
+    assert snapshot["source"]["source"] == "upstream"
+    assert snapshot["source"]["cache_stale"] is True
+    assert model_registry.available_model_ids() == ["fresh-live"]
+    assert len(calls) == 1
+
+
+def test_expired_disk_cache_failure_does_not_advertise_stale_models(monkeypatch):
+    calls = _mock_listing(monkeypatch, status=503)
+    written = model_registry._models_cache_path().stat().st_mtime
+    monkeypatch.setattr(model_registry.time, "time", lambda: written + 61)
+    snapshot = model_registry.model_snapshot()
+    assert snapshot["model_ids"] == []
+    assert snapshot["default_model"] is None
+    assert snapshot["source"]["source"] == "none"
+    assert snapshot["source"]["status"] == "unknown"
+    assert snapshot["source"]["cache_stale"] is True
+    assert "503" in snapshot["source"]["error"]
+    assert len(calls) == 1
+
+
+def test_disk_cache_expires_without_restarting_process(monkeypatch):
+    calls = _mock_listing(monkeypatch, {"models": ["fresh-live"]})
+    written = model_registry._models_cache_path().stat().st_mtime
+    now = [written + 10]
+    monkeypatch.setattr(model_registry.time, "time", lambda: now[0])
+    assert model_registry.available_model_ids() == ["gpt-fixture-a", "gpt-fixture-b"]
+    assert not calls
+    now[0] = written + 60
+    assert model_registry.available_model_ids() == ["fresh-live"]
+    assert len(calls) == 1

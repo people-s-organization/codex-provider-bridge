@@ -178,6 +178,8 @@ http://<your-host>:<port>/v1
 
 API Key 一般可以随便填一个占位值，是否必须填写取决于你的 Agent 客户端。
 
+运维参数、严格兼容模式、回滚部署与真实 Agent 验收见 [OPERATIONS.md](OPERATIONS.md)。
+
 ## 接口兼容范围
 
 ### 能力边界（先说清楚）
@@ -185,8 +187,8 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 - ✅ **文本问答**：单轮、多轮、SSE 流式都可用；`reasoning_effort`、JSON schema 约束、旧 Completions 形状都走得通。
 - ✅ **函数工具调用（function tool calling）**：`tools` / 旧版 `functions` 会转发给上游，上游流式返回的 `function_call` 会被转换成 OpenAI 形状的 `tool_calls`（chat）或 `function_call` item（responses）；非流式与 SSE 流式、`tool_choice` 的 `auto`/`none`/`required`/指定函数、`parallel_tool_calls` 都支持。
 - ⚠️ **桥不执行工具**：它只负责"把模型的调用请求交给客户端、再把客户端的结果带回去"。真正读写文件、跑命令的是你的客户端；historically 这一点最容易误解，所以单独写出来。
-- ⚠️ **只转发 `type: "function"` 的工具**：其它工具类型（如 `web_search`）会被丢弃，并在 instructions 里留一条说明。
-- ⚠️ **输出上限不支持**：`max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 上游一律拒绝，桥直接忽略。
+- ⚠️ **只支持 `type: "function"` 工具**：其它工具类型（包括混合工具列表里的非函数工具）明确拒绝，不再静默丢弃。
+- ⚠️ **输出上限不支持**：默认兼容模式接受这些参数但通过 `X-Bridge-Warnings` 告知未兑现；`BRIDGE_STRICT_COMPATIBILITY=true` 时拒绝。不会截断字符来冒充 token 预算。
 
 验证方式（2026-09-10 实测，都是打真实上游）：
 
@@ -199,7 +201,7 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 | `/v1/responses` | 非流式输出 `function_call` item（`call_id`/`name`/`arguments`），流式透传 `response.function_call_arguments.delta` 等事件 |
 | `strict: true` 工具 schema | 上游接受（HTTP 200） |
 
-`/health` 的 `capabilities.tool_calling` 会返回 `available: true`（`scope: bridge`）。
+`/health` 只返回最小健康状态、启动时间和部署 commit，不再触发外网能力探测；详细能力展示在首页（配置密钥后需要鉴权）。函数调用能力标识只表示桥的协议支持，不宣称所有上游模型均实测可用。
 
 ### 文本接口
 
@@ -210,27 +212,29 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 - `response_format={"type":"json_object"}` 和常见 `json_schema` 会被转换成额外 instructions，引导上游返回纯 JSON
 - `/v1/responses` 的 `text.format.type=json_schema` 会被转换成额外 instructions，引导上游返回符合 schema 的纯 JSON
 - 多轮对话的 content part 会按角色重新定型：assistant 轮次只发 `output_text` / `refusal`，user 轮次只发 `input_text` / `input_image`。上游对 assistant 轮次收到 `input_text` 会整包报 `Invalid value: 'input_text'`，所以 `/v1/responses` 的 `input` 里客户端自己传的 message item 也会做同样归一化（其他 item 类型原样透传）
-- 历史里的工具调用会被重建成上游格式：assistant 的 `tool_calls` → `function_call`，`role:"tool"` 的结果按 `tool_call_id` 配成 `function_call_output`。上游只接受成对出现的 `function_call` / `function_call_output`，配不上的（缺 id、或上文没有对应 call）会降级成一条 user 文本，避免整包报 `No tool call found for function call output`；`/v1/responses` 里客户端自己传的孤儿 `function_call_output` 同样降级
+- 工具历史严格配对：assistant `tool_calls` → `function_call`，tool 结果 → `function_call_output`。缺失 ID、孤儿结果或重复结果在请求校验阶段报错，不再降级为 user 文本。旧版 `function_call` / `role:"function"` 也按配对语义重放。
+- system/developer 保留角色与顺序；Responses reasoning 与原生 item 元数据保留，不把高优先级消息变成 user。
+- `previous_response_id` 和 `store:true` 明确拒绝：订阅通道无桥端持久化续链，请客户端回传完整历史。
 - 错误响应统一成 OpenAI 风格的 `{ "error": { "message", "type", "param", "code" } }`
 
 尽量兼容但不能完全等价的地方：
 
-- `tool_choice="required"`、指定函数、`parallel_tool_calls` 都已支持（见「能力边界」）；桥只转发调用、不执行工具，工具的真正执行方是客户端。只有 `type` 不是 `function` 的工具（如 `web_search`）会被丢弃并留一条说明。
+- `tool_choice="required"`、指定函数、`parallel_tool_calls` 都已支持（见「能力边界」）；桥只转发调用、不执行工具，工具的真正执行方是客户端。`type` 不是 `function` 的工具（如 `web_search`）会被明确拒绝。
 - `n > 1`、`best_of`、`logprobs` 会返回明确错误。原因是上游 Codex responses 通道按 turn 返回单个回答，也不返回 token 级 logprobs。
-- `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 不转发给上游：实测 Codex responses 通道对这四个参数一律返回 `400 Unsupported parameter`，因此桥接层直接忽略输出上限（传了不会报错，但也不会生效）。
+- `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 不转发给上游：实测 Codex responses 通道对这四个参数一律返回 `400 Unsupported parameter`，因此兼容模式不转发并在响应头告警，严格模式返回校验错误。
 - Chat Completions 的音频输出 modality 不走这里；请用 `/v1/audio/speech`。音频输入、转写、翻译等端点如果需要完整 OpenAI 行为，请配置 `OPENAI_API_KEY` 走代理。
 - Assistants、Files、Batches、Vector Stores、Fine-tuning、Embeddings、Moderations 等未内置端点：有 `OPENAI_API_KEY` 时代理到官方 API；没有时返回 `501 unsupported_endpoint` 并说明 ChatGPT/Codex subscription auth 没有向桥接层暴露对应 REST 能力。
 
 `/v1/models` 不维护任何写死的主列表或兜底列表，读取顺序是：
 
 1. `CHATGPT_MODELS`
-2. `~/.codex/models_cache.json`
-3. 缓存为空时向上游查询一次（`CHATGPT_MODELS_URL`）
+2. 未过期的 `$CODEX_HOME/models_cache.json`（默认 `~/.codex`，按文件 mtime，60 秒）
+3. 缓存为空或过期时查询上游（`CHATGPT_MODELS_URL`）；按 URL/账号/凭据/真实 client version 隔离缓存并合并并发请求
 4. `CHATGPT_EXTRA_MODELS` 追加
 
-如果以上都没有真实来源，`/v1/models` 就返回空列表，`/health` 的 `model_source` 会说明当前来源和失败原因。
+如果以上都没有来源，`/v1/models` 返回空列表；首页的模型快照包含来源和失败原因。过期缓存不在刷新失败后冒充可用模型。显式环境配置是用户声明，不等于已调用验证。上游要求的 client_version 从 `CHATGPT_CLIENT_VERSION`、真实缓存或已安装的 `codex --version` 获取，不写死版本。
 
-默认测试模型读取顺序是：
+默认测试模型仅能在实际发现集合中选择（配置不存在的模型不会被加入列表），读取顺序是：
 
 1. `CHATGPT_DEFAULT_MODEL`
 2. `~/.codex/config.toml` 中的 `model`
@@ -250,7 +254,8 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 
 - Codex 的模型列表（本地缓存和上游 `/backend-api/codex/models`）**只包含文本模型**，原始响应里没有任何 `gpt-image-*` / `tts-*` / `gpt-realtime-*` 条目；`/backend-api/codex/image_generation/models`、`/v1/realtime/models` 等媒体列表路由全部 404，`api.openai.com/v1/models` 用 ChatGPT 登录态会被 403 拒绝。
 - 媒体在上游是**能力/工具**而不是模型：ChatGPT web 的 `/backend-api/models` 用 `enabled_tools` 里的 `image_gen_tool_enabled` / `dalle_3` 标记哪些模型能用图片工具；realtime 语音只接受 `?model=` 参数，省略会直接 `missing_model`。
-- 因此 bridge 能做的是：探测图片能力（`/health` 的 `capabilities.image_generation`，含真实声明该能力的模型名），并在图片请求没配 `CHATGPT_MEDIA_MODEL` 时自动用探测到的真实模型驱动 `image_generation` 工具——不会把 `gpt-image-2` 这类图片模型名当成 Responses 模型发上去（上游会报 `not supported when using Codex with a ChatGPT account`）。
+- 图片能力通过首页的模型快照展示；探测失败或缺少证据时 `available:null/status:unknown`，只有明确工具列表没有图片标记时才是 unsupported。这些名称是工具宿主，不是图片生成器的模型身份。
+- Codex 图片响应的 `model` / `codex_model` 表示实际驱动模型，`requested_model` 保存客户端请求标签，`image_model:null` 明确底层生成器身份未披露，并附带说明。
 
 ## 请求示例
 

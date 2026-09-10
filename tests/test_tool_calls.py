@@ -217,7 +217,7 @@ def test_responses_stream_passes_function_call_events(monkeypatch):
     assert '"type": "function_call"' in response.text
 
 
-def test_non_function_tools_are_dropped_with_a_note(monkeypatch):
+def test_non_function_tools_are_rejected_before_upstream(monkeypatch):
     captured = []
     _patch_stream(monkeypatch, [*_tool_events(), _completed()], captured)
 
@@ -230,10 +230,9 @@ def test_non_function_tools_are_dropped_with_a_note(monkeypatch):
         },
     )
 
-    assert response.status_code == 200
-    payload = captured[0]
-    assert "tools" not in payload
-    assert "web_search" in payload["instructions"]
+    assert response.status_code in {400, 422}
+    assert "function tools" in response.text
+    assert captured == []
 
 
 def test_legacy_functions_are_forwarded(monkeypatch):

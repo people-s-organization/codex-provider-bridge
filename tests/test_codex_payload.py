@@ -1,3 +1,5 @@
+import pytest
+
 from bridge import ChatGPTBridge
 from schemas import ChatCompletionRequest, ResponsesRequest
 
@@ -94,45 +96,14 @@ def test_assistant_tool_calls_are_replayed_as_function_calls():
     }
 
 
-def test_tool_call_without_id_is_not_replayed():
-    payload = _chat_payload(
-        [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": None, "tool_calls": [{"type": "function"}]},
-        ]
-    )
-
-    assert payload["input"][1]["type"] == "message"
-    assert payload["input"][1]["content"][0]["type"] == "output_text"
-    assert "tool_calls omitted" in payload["input"][1]["content"][0]["text"]
-
-
-def test_unpaired_tool_result_degrades_to_user_text():
-    payload = _chat_payload(
-        [
-            {"role": "user", "content": "hello"},
-            {"role": "tool", "tool_call_id": "call_missing", "content": "42"},
-        ]
-    )
-
-    assert payload["input"][1]["type"] == "message"
-    assert payload["input"][1]["role"] == "user"
-    part = payload["input"][1]["content"][0]
-    assert part["type"] == "input_text"
-    assert "call_id=call_missing" in part["text"]
-    assert "42" in part["text"]
-
-
-def test_tool_result_without_call_id_degrades_to_user_text():
-    payload = _chat_payload(
-        [
-            {"role": "user", "content": "hello"},
-            {"role": "tool", "content": "42"},
-        ]
-    )
-
-    assert payload["input"][1]["type"] == "message"
-    assert "unknown call_id" in payload["input"][1]["content"][0]["text"]
+@pytest.mark.parametrize("message", [
+    {"role": "assistant", "content": None, "tool_calls": [{"type": "function"}]},
+    {"role": "tool", "tool_call_id": "call_missing", "content": "42"},
+    {"role": "tool", "content": "42"},
+])
+def test_malformed_or_orphan_tool_history_is_rejected(message):
+    with pytest.raises(ValueError):
+        _chat_payload([{"role": "user", "content": "hello"}, message])
 
 
 def test_image_parts_are_only_valid_for_user_turns():
@@ -147,7 +118,7 @@ def test_image_parts_are_only_valid_for_user_turns():
     assert _parts(payload, 1) == [{"type": "output_text", "text": "[image: https://x/z.png]"}]
 
 
-def test_system_messages_become_instructions_not_input():
+def test_system_messages_preserve_instruction_role():
     bridge = ChatGPTBridge()
     payload = bridge._build_payload(
         ChatCompletionRequest(
@@ -159,8 +130,9 @@ def test_system_messages_become_instructions_not_input():
         )
     )
 
-    assert payload["instructions"] == "be brief"
-    assert len(payload["input"]) == 1
+    assert payload["input"][0]["role"] == "system"
+    assert payload["input"][0]["content"] == [{"type": "input_text", "text": "be brief"}]
+    assert len(payload["input"]) == 2
 
 
 def test_responses_input_items_are_normalized_per_role():
@@ -175,6 +147,7 @@ def test_responses_input_items_are_normalized_per_role():
                     "role": "assistant",
                     "content": [{"type": "input_text", "text": "hello"}],
                 },
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
                 {"type": "function_call_output", "call_id": "call_1", "output": "42"},
             ],
         )
@@ -182,8 +155,8 @@ def test_responses_input_items_are_normalized_per_role():
 
     assert payload["input"][0]["content"] == [{"type": "input_text", "text": "hi"}]
     assert payload["input"][1]["content"] == [{"type": "output_text", "text": "hello"}]
-    assert payload["input"][2]["type"] == "message"
-    assert "call_id=call_1" in payload["input"][2]["content"][0]["text"]
+    assert payload["input"][2]["type"] == "function_call"
+    assert payload["input"][3]["output"] == "42"
 
 
 def test_responses_paired_tool_items_pass_through():
