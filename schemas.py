@@ -201,9 +201,20 @@ class OpenAICompatModel(BaseModel):
 
 
 class GenerationRequest(OpenAICompatModel):
-    def compatibility_warnings(self) -> List[str]:
+    # Compatibility notes discovered while building the upstream request (for example a
+    # tool downgraded out of strict mode). Surfaced through the warning header.
+    bridge_warnings: List[str] = Field(default_factory=list, exclude=True)
+
+    def add_bridge_warning(self, message: str) -> None:
+        if message not in self.bridge_warnings:
+            self.bridge_warnings.append(message)
+
+    def ignored_parameter_warnings(self) -> List[str]:
         ignored = {"max_tokens", "max_completion_tokens", "max_output_tokens", "truncation", "temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "logit_bias", "seed", "user", "service_tier", "metadata", "logprobs", "top_logprobs", "best_of", "suffix", "echo"}
         return [f"{key} is ignored by the Codex bridge" for key in sorted(self.model_fields_set & ignored) if getattr(self, key, None) is not None]
+
+    def compatibility_warnings(self) -> List[str]:
+        return [*self.ignored_parameter_warnings(), *self.bridge_warnings]
 
     @model_validator(mode="after")
     def validate_compatibility(self):

@@ -98,6 +98,42 @@ class ToolCallAccumulator:
         return self._call_for(event), action
 
 
+def _strict_schema_compatible(schema: Any) -> bool:
+    """Whether a JSON Schema satisfies the backend's strict function-tool rules.
+
+    Strict sampling requires every object node to forbid extra properties and to list
+    every declared property in ``required``. The backend rejects the whole request
+    otherwise ("'required' is required to be supplied and to be an array including
+    every key in properties"), so the bridge checks before forwarding ``strict``.
+    """
+
+    if isinstance(schema, list):
+        return all(_strict_schema_compatible(item) for item in schema)
+    if not isinstance(schema, dict):
+        return True
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        if schema.get("additionalProperties") is not False:
+            return False
+        required = schema.get("required")
+        if not isinstance(required, list) or set(properties) - set(required):
+            return False
+
+    # "properties"/"$defs"/"definitions" map names to schemas; the rest hold schemas.
+    for key in ("properties", "$defs", "definitions"):
+        value = schema.get(key)
+        if isinstance(value, dict) and not all(
+            _strict_schema_compatible(child) for child in value.values()
+        ):
+            return False
+    for key in ("items", "additionalProperties", "oneOf", "anyOf", "allOf", "prefixItems",
+                "not", "if", "then", "else"):
+        if key in schema and not _strict_schema_compatible(schema[key]):
+            return False
+    return True
+
+
 class ChatGPTBridge:
     def __init__(self):
         self.base_url = settings.chatgpt_base_url.rstrip("/")
@@ -441,11 +477,29 @@ class ChatGPTBridge:
         the Codex backend both use the flat ``{type, name, description, parameters}``
         shape. Only client-executed ``function`` tools are supported; all other types
         fail validation explicitly.
+
+        ``strict: true`` is only forwarded when the schema already satisfies the strict
+        sampling rules the backend enforces (``additionalProperties: false`` and every
+        property listed in ``required``, at every level). Otherwise the tool is still
+        forwarded without ``strict`` and a warning is reported, because failing the whole
+        request over an optional guarantee would break ordinary tool use.
         """
 
         from schemas import normalize_tools
 
-        return normalize_tools(tools), []
+        forwarded = normalize_tools(tools)
+        warnings: list[str] = []
+        for definition in forwarded:
+            if not definition.get("strict"):
+                continue
+            if _strict_schema_compatible(definition.get("parameters")):
+                continue
+            definition.pop("strict", None)
+            warnings.append(
+                f"strict mode was dropped for tool '{definition.get('name')}': the schema "
+                "does not set additionalProperties false and require every property"
+            )
+        return forwarded, warnings
 
     def _normalize_tool_choice(self, tool_choice: Any, function_call: Any = None) -> Any:
         """Map Chat Completions / Responses tool_choice onto the Codex shape."""
@@ -463,13 +517,16 @@ class ChatGPTBridge:
         function_call: Any = None,
         legacy_functions: Any = None,
         parallel_tool_calls: Any = None,
-    ) -> str:
-        """Attach forwarded tools to an upstream payload, returning final instructions."""
+    ) -> tuple[str, list[str]]:
+        """Attach forwarded tools to an upstream payload.
+
+        Returns the final instructions and any bridge-side compatibility warnings.
+        """
 
         if tools is not None and legacy_functions is not None:
             raise ValueError("tools and legacy functions cannot both be specified")
         combined = tools if tools is not None else [{"type": "function", "function": f} for f in (legacy_functions or [])]
-        forwarded, _ = self._normalize_tool_definitions(combined)
+        forwarded, warnings = self._normalize_tool_definitions(combined)
         choice = self._normalize_tool_choice(tool_choice, function_call)
         if isinstance(choice, dict) and choice["name"] not in {t["name"] for t in forwarded}:
             raise ValueError("tool_choice names an undefined function")
@@ -483,7 +540,7 @@ class ChatGPTBridge:
             payload["tool_choice"] = choice
         if parallel_tool_calls is not None:
             payload["parallel_tool_calls"] = parallel_tool_calls
-        return instructions
+        return instructions, warnings
 
     def _unsupported_chat_options_error(self, request: ChatCompletionRequest) -> dict[str, Any] | None:
         if request.n not in {None, 1}:
@@ -544,7 +601,7 @@ class ChatGPTBridge:
         )
 
         tool_payload: dict[str, Any] = {}
-        instructions = self._apply_tools(
+        instructions, tool_warnings = self._apply_tools(
             tool_payload,
             instructions,
             tools=request.tools,
@@ -553,6 +610,8 @@ class ChatGPTBridge:
             legacy_functions=request.functions,
             parallel_tool_calls=request.parallel_tool_calls,
         )
+        for warning in tool_warnings:
+            request.add_bridge_warning(warning)
 
         payload: dict[str, Any] = {
             "model": self._resolve_model_name(request.model),
@@ -663,13 +722,15 @@ class ChatGPTBridge:
             request.text.get("format") if isinstance(request.text, dict) else None,
         )
         tool_payload: dict[str, Any] = {}
-        instructions = self._apply_tools(
+        instructions, tool_warnings = self._apply_tools(
             tool_payload,
             instructions,
             tools=request.tools,
             tool_choice=request.tool_choice,
             parallel_tool_calls=request.parallel_tool_calls,
         )
+        for warning in tool_warnings:
+            request.add_bridge_warning(warning)
 
         payload: dict[str, Any] = {
             "model": self._resolve_model_name(request.model),
