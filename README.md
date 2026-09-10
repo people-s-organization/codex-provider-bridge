@@ -135,6 +135,8 @@ CHATGPT_MEDIA_MODEL=
 CHATGPT_REALTIME_MODEL=
 CHATGPT_MODELS_FILE=~/.codex/models_cache.json
 CHATGPT_CODEX_CONFIG_FILE=~/.codex/config.toml
+CHATGPT_MODELS_URL=
+CHATGPT_CAPABILITIES_URL=
 CHATGPT_MODEL_ALIASES=
 CHATGPT_EXTRA_MODEL_ALIASES=
 ```
@@ -148,14 +150,16 @@ CHATGPT_EXTRA_MODEL_ALIASES=
 - `CHATGPT_AUTH_METHOD`：兼容性兜底配置；可选 `prompt | auto | browser | device`
 - `HOST` / `PORT`：服务监听地址
 - `CHATGPT_BASE_URL`：默认是 `https://chatgpt.com`
-- `CHATGPT_MODELS`：显式指定 `/v1/models` 返回的模型列表，支持逗号分隔或 JSON 数组
+- `CHATGPT_MODELS`：显式指定 `/v1/models` 返回的模型列表，支持逗号分隔或 JSON 数组；设置后不再读取缓存和上游
 - `CHATGPT_EXTRA_MODELS`：在自动模型列表后追加模型，例如刚发布但本地缓存还没刷新的模型
-- `CHATGPT_DEFAULT_MODEL`：首页测试表单默认选中的模型
-- `CHATGPT_MEDIA_MODEL`：图片接口调用 Codex `image_generation` 工具时使用的上游 Responses 模型；默认沿用 `CHATGPT_DEFAULT_MODEL`，再兜底到 `gpt-5.5`
-- `CHATGPT_REALTIME_MODEL`：语音接口调用 realtime WebSocket 时使用的模型，默认 `gpt-realtime-1.5`
+- `CHATGPT_DEFAULT_MODEL`：首页测试表单默认选中的模型；不设置时用 `~/.codex/config.toml` 里的 `model`，再退到当前列表第一个
+- `CHATGPT_MEDIA_MODEL`：图片接口调用 Codex `image_generation` 工具时使用的上游 Responses 模型；不设置时按 `CHATGPT_DEFAULT_MODEL` → 请求里真实存在的 `model` → 探测到的默认模型解析（`gpt-image-*` 这类图片模型名不会被当成 Responses 模型，上游会直接拒绝）
+- `CHATGPT_REALTIME_MODEL`：语音接口调用 realtime WebSocket 时使用的模型；默认用请求里的 `model`
 - `CHATGPT_MODELS_FILE`：Codex 模型缓存路径，默认读取 `~/.codex/models_cache.json`
 - `CHATGPT_CODEX_CONFIG_FILE`：Codex 配置路径，默认读取 `~/.codex/config.toml` 中的 `model`
-- `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES`：模型别名映射，支持 JSON 对象或 `old=new,old2=new2`
+- `CHATGPT_MODELS_URL`：缓存为空时向上游查询模型列表的地址，默认 `$CHATGPT_BASE_URL/backend-api/codex/models`；设为空值即关闭上游查询
+- `CHATGPT_CAPABILITIES_URL`：能力探测地址（ChatGPT web 模型列表，用 `enabled_tools` 标记图片工具），默认 `$CHATGPT_BASE_URL/backend-api/models`；设为空值即关闭能力探测
+- `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES`：模型别名映射，支持 JSON 对象或 `old=new,old2=new2`；默认不含任何别名
 
 ## 使用方式
 
@@ -190,26 +194,26 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 
 - `tool_choice="required"`、指定函数调用、强制 `function_call` 会返回 `501 unsupported_tool_calling`。原因是 ChatGPT/Codex 订阅登录态目前暴露给这个桥的是 Codex responses 通道，不是完整 OpenAI tool_calls/function_call 协议；桥接层不能伪造会被客户端正确执行的工具调用。
 - `n > 1`、`best_of`、`logprobs` 会返回明确错误。原因是上游 Codex responses 通道按 turn 返回单个回答，也不返回 token 级 logprobs。
+- `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 不转发给上游：实测 Codex responses 通道对这四个参数一律返回 `400 Unsupported parameter`，因此桥接层直接忽略输出上限（传了不会报错，但也不会生效）。
 - Chat Completions 的音频输出 modality 不走这里；请用 `/v1/audio/speech`。音频输入、转写、翻译等端点如果需要完整 OpenAI 行为，请配置 `OPENAI_API_KEY` 走代理。
 - Assistants、Files、Batches、Vector Stores、Fine-tuning、Embeddings、Moderations 等未内置端点：有 `OPENAI_API_KEY` 时代理到官方 API；没有时返回 `501 unsupported_endpoint` 并说明 ChatGPT/Codex subscription auth 没有向桥接层暴露对应 REST 能力。
 
-`/v1/models` 不再维护写死的主列表，读取顺序是：
+`/v1/models` 不维护任何写死的主列表或兜底列表，读取顺序是：
 
 1. `CHATGPT_MODELS`
 2. `~/.codex/models_cache.json`
-3. 内置兜底列表
+3. 缓存为空时向上游查询一次（`CHATGPT_MODELS_URL`）
 4. `CHATGPT_EXTRA_MODELS` 追加
+
+如果以上都没有真实来源，`/v1/models` 就返回空列表，`/health` 的 `model_source` 会说明当前来源和失败原因。
 
 默认测试模型读取顺序是：
 
 1. `CHATGPT_DEFAULT_MODEL`
 2. `~/.codex/config.toml` 中的 `model`
-3. 当前模型列表第一个
+3. 当前模型列表第一个（列表为空时首页不预填模型）
 
-默认别名仍保留 OpenAI API 客户端常见模型名的兼容映射，也可以通过 `CHATGPT_MODEL_ALIASES` 完全覆盖：
-
-- `gpt-4.1` 会映射到当前默认模型
-- `gpt-4.1-mini` 会映射到当前模型列表里的第一个 `mini` 模型
+默认不带任何内置别名，别名完全由 `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES` 决定。
 
 ### 媒体接口
 
@@ -217,8 +221,17 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 - `/v1/audio/speech`：优先使用 ChatGPT/Codex bearer 直连 OpenAI realtime WebSocket，收集 `response.output_audio.delta` 后返回真实音频；如果没有 ChatGPT token 但有 `OPENAI_API_KEY`，会兜底代理到 OpenAI Speech API
 - ChatGPT realtime 输出原生是 24 kHz PCM；`wav` / `pcm` 可直接返回，`mp3` / `aac` / `flac` / `opus` 需要本机 `ffmpeg`
 - 如果缺少对应真实上游凭据，媒体接口会返回 `501`，不会返回假图片或假音频
+- 媒体接口的 `model` 是必填项，缺失或为空会返回 `422`；bridge 不会替你猜一个模型名。图片走 Codex 通道时，上游 Responses 模型按 `CHATGPT_MEDIA_MODEL` → `CHATGPT_DEFAULT_MODEL` → 请求里真实存在的 `model` → 探测到的默认模型解析，语音走 `CHATGPT_REALTIME_MODEL` → 请求里的 `model`
+
+媒体能力探测（为什么媒体模型不会出现在 `/v1/models` 里）：
+
+- Codex 的模型列表（本地缓存和上游 `/backend-api/codex/models`）**只包含文本模型**，原始响应里没有任何 `gpt-image-*` / `tts-*` / `gpt-realtime-*` 条目；`/backend-api/codex/image_generation/models`、`/v1/realtime/models` 等媒体列表路由全部 404，`api.openai.com/v1/models` 用 ChatGPT 登录态会被 403 拒绝。
+- 媒体在上游是**能力/工具**而不是模型：ChatGPT web 的 `/backend-api/models` 用 `enabled_tools` 里的 `image_gen_tool_enabled` / `dalle_3` 标记哪些模型能用图片工具；realtime 语音只接受 `?model=` 参数，省略会直接 `missing_model`。
+- 因此 bridge 能做的是：探测图片能力（`/health` 的 `capabilities.image_generation`，含真实声明该能力的模型名），并在图片请求没配 `CHATGPT_MEDIA_MODEL` 时自动用探测到的真实模型驱动 `image_generation` 工具——不会把 `gpt-image-2` 这类图片模型名当成 Responses 模型发上去（上游会报 `not supported when using Codex with a ChatGPT account`）。
 
 ## 请求示例
+
+示例里的 `<model-id>` 换成 `/v1/models` 返回的真实模型名；这个桥不会替你选模型。
 
 Chat Completions：
 
@@ -226,7 +239,7 @@ Chat Completions：
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.5",
+    "model": "<model-id>",
     "messages": [{"role": "user", "content": "Reply with exactly: bridge ok"}],
     "reasoning_effort": "medium"
   }'
@@ -238,7 +251,7 @@ Chat Completions 流式：
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.5",
+    "model": "<model-id>",
     "messages": [{"role": "user", "content": "Count to three."}],
     "stream": true,
     "stream_options": {"include_usage": true}
@@ -251,7 +264,7 @@ Responses + JSON Schema：
 curl http://127.0.0.1:8000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.5",
+    "model": "<model-id>",
     "input": [{"role": "user", "content": [{"type": "input_text", "text": "summarize this bridge"}]}],
     "text": {
       "format": {
@@ -274,7 +287,7 @@ curl http://127.0.0.1:8000/v1/responses \
 ```bash
 curl http://127.0.0.1:8000/v1/images/generations \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-image-2","prompt":"a bridge diagram","size":"1024x1024","quality":"auto","response_format":"b64_json"}'
+  -d '{"model":"<image-model>","prompt":"a bridge diagram","size":"1024x1024","quality":"auto","response_format":"b64_json"}'
 ```
 
 音频生成接口：
@@ -283,8 +296,10 @@ curl http://127.0.0.1:8000/v1/images/generations \
 curl http://127.0.0.1:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -o speech.wav \
-  -d '{"model":"gpt-4o-mini-tts","input":"bridge audio test","voice":"marin","response_format":"wav"}'
+  -d '{"model":"<speech-model>","input":"bridge audio test","voice":"marin","response_format":"wav"}'
 ```
+
+`<image-model>` / `<speech-model>` 用该账号实际可用的模型名，可先查 `/v1/models`。
 
 ## 调试接口
 

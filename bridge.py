@@ -15,7 +15,7 @@ import websockets
 from dotenv import load_dotenv
 
 from config import settings
-from model_registry import resolve_model_name
+from model_registry import default_model_id, is_available_model, resolve_model_name
 from schemas import (
     AudioSpeechRequest,
     ChatCompletionRequest,
@@ -77,23 +77,39 @@ class ChatGPTBridge:
     def _resolve_model_name(self, model_name: str) -> str:
         return resolve_model_name(model_name)
 
-    def _resolve_media_responses_model(self) -> str:
+    def _resolve_media_responses_model(self, request: ImageGenerationRequest) -> str:
+        """Pick the Responses model that drives the Codex ``image_generation`` tool.
+
+        The image endpoint's own ``model`` field names an image model (``gpt-image-*``)
+        which the Codex Responses endpoint rejects outright, so it is only used when it
+        happens to be a model this account really exposes.
+        """
+
         load_dotenv(override=False)
-        configured_model = (
-            os.getenv("CHATGPT_MEDIA_MODEL")
-            or os.getenv("CHATGPT_DEFAULT_MODEL")
-            or "gpt-5.5"
-        ).strip()
-        return self._resolve_model_name(configured_model or "gpt-5.5")
+        configured_model = str(os.getenv("CHATGPT_MEDIA_MODEL") or "").strip()
+        if configured_model:
+            return self._resolve_model_name(configured_model)
+
+        default_model = str(os.getenv("CHATGPT_DEFAULT_MODEL") or "").strip()
+        if default_model:
+            return self._resolve_model_name(default_model)
+
+        requested_model = self._resolve_model_name(request.model)
+        if is_available_model(requested_model):
+            return requested_model
+
+        detected_default = default_model_id()
+        if detected_default:
+            return detected_default
+
+        return requested_model
 
     def _resolve_realtime_model(self, request: AudioSpeechRequest) -> str:
         load_dotenv(".env", override=False)
         configured_model = str(os.getenv("CHATGPT_REALTIME_MODEL") or "").strip()
         if configured_model:
-            return configured_model
-        if request.model and request.model.startswith("gpt-realtime"):
-            return request.model
-        return "gpt-realtime-1.5"
+            return self._resolve_model_name(configured_model)
+        return self._resolve_model_name(request.model)
 
     def _resolve_reasoning_effort(self, request: ChatCompletionRequest) -> str | None:
         if request.reasoning_effort:
@@ -332,9 +348,9 @@ class ChatGPTBridge:
         reasoning_effort = self._resolve_reasoning_effort(request)
         if reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort}
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
-        if max_output_tokens is not None:
-            payload["max_output_tokens"] = max_output_tokens
+        # Client output limits are intentionally not forwarded: the ChatGPT/Codex
+        # responses endpoint rejects max_output_tokens, max_tokens and
+        # max_completion_tokens with HTTP 400 "Unsupported parameter".
 
         return payload
 
@@ -393,8 +409,8 @@ class ChatGPTBridge:
         }
         if request.reasoning and request.reasoning.effort:
             payload["reasoning"] = {"effort": request.reasoning.effort}
-        if request.max_output_tokens is not None:
-            payload["max_output_tokens"] = request.max_output_tokens
+        # max_output_tokens is rejected upstream ("Unsupported parameter"), so the
+        # request's limit is deliberately dropped here.
         return payload
 
     def _usage_from_response(self, response: dict[str, Any]) -> dict[str, int]:
@@ -904,7 +920,7 @@ class ChatGPTBridge:
     def _build_codex_image_payload(self, request: ImageGenerationRequest) -> dict[str, Any]:
         output_format = self._image_output_format(request)
         return {
-            "model": self._resolve_media_responses_model(),
+            "model": self._resolve_media_responses_model(request),
             "input": [
                 {
                     "role": "user",

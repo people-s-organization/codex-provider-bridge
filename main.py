@@ -6,10 +6,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 import httpx
 
 from config import settings
-from model_registry import available_model_ids, available_models, default_model_id
+from model_registry import model_snapshot
 from schemas import (
     AudioSpeechRequest,
     ChatCompletionRequest,
@@ -226,9 +227,12 @@ async def home(request: Request):
     agent_base_urls = resolve_agent_base_urls(request)
     escaped_base_url = html.escape(base_url)
     escaped_bind_address = html.escape(bind_address)
-    models = available_models()
-    default_model = default_model_id()
+    snapshot = await run_in_threadpool(model_snapshot, include_capabilities=True)
+    models = snapshot["models"]
+    default_model = snapshot["default_model"] or ""
     default_model_json = json.dumps(default_model).replace("</", "<\\/")
+    model_source_info = snapshot["source"]
+    model_capabilities = snapshot["capabilities"]
 
     model_links = "".join(
         f"<li><code>{html.escape(model['id'])}</code></li>"
@@ -241,6 +245,39 @@ async def home(request: Request):
     agent_base_link_items = "".join(
         f"<li><a href=\"{html.escape(url.rsplit('/v1', 1)[0], quote=True)}\"><code>{html.escape(url)}</code></a></li>"
         for url in agent_base_urls
+    )
+
+    escaped_source = html.escape(str(model_source_info.get("source")))
+    escaped_cache_file = html.escape(str(model_source_info.get("cache_file")))
+    if models:
+        model_source_note = (
+            f"<p>Source: <code>{escaped_source}</code>"
+            f" · <code>{escaped_cache_file}</code></p>"
+        )
+    else:
+        escaped_source_error = html.escape(
+            str(model_source_info.get("error") or "no configured model source returned any model")
+        )
+        model_source_note = (
+            "<p>No models available. Nothing is hard-coded in this bridge, so the list stays "
+            f"empty until a real source reports models.<br />Source: <code>{escaped_source}</code>"
+            f" · <code>{escaped_cache_file}</code><br />{escaped_source_error}</p>"
+        )
+
+    image_capability = model_capabilities["image_generation"]
+    if image_capability["available"]:
+        image_note = (
+            "<p>Image generation: <code>available</code> "
+            f"({len(image_capability['tool_models'])} models advertise the image tool)</p>"
+        )
+    else:
+        image_note = (
+            "<p>Image generation: <code>not advertised</code>"
+            f"<br />{html.escape(str(model_capabilities.get('error') or 'no capability source'))}</p>"
+        )
+    realtime_note = (
+        "<p>Realtime speech: <code>no upstream listing</code>"
+        f"<br />{html.escape(str(model_capabilities['realtime_speech']['detail']))}</p>"
     )
 
     return f"""
@@ -475,6 +512,7 @@ async def home(request: Request):
               <p><a href="/models">/models</a></p>
               <p><a href="/v1/models">/v1/models</a></p>
               <ul>{model_links}</ul>
+              {model_source_note}
             </article>
 
             <article class="card">
@@ -493,6 +531,8 @@ async def home(request: Request):
               <p><code>POST /images/generations</code></p>
               <p><code>POST /v1/audio/speech</code></p>
               <p><code>POST /audio/speech</code></p>
+              {image_note}
+              {realtime_note}
             </article>
           </section>
 
@@ -675,7 +715,7 @@ async def home(request: Request):
             }},
             images: {{
               path: "/v1/images/generations",
-              model: "gpt-image-2",
+              model: "",
               prompt: "A clean product-style diagram of a local API bridge",
               promptLabel: "Image Prompt",
               reasoning: false,
@@ -687,7 +727,7 @@ async def home(request: Request):
             }},
             audio: {{
               path: "/v1/audio/speech",
-              model: "gpt-4o-mini-tts",
+              model: "",
               prompt: "Bridge audio test.",
               promptLabel: "Speech Input",
               reasoning: false,
@@ -736,6 +776,12 @@ async def home(request: Request):
             const reasoningEffort = document.getElementById("reasoning-effort").value;
             const systemPrompt = document.getElementById("system-prompt").value.trim();
             const userPrompt = document.getElementById("user-prompt").value.trim();
+
+            if (!model) {{
+              resultStatus.textContent = "Please enter a model.";
+              resultBody.textContent = "This bridge does not guess a model; the request must name one.";
+              return null;
+            }}
 
             if (!userPrompt) {{
               resultStatus.textContent = "Please enter a prompt.";
@@ -1030,6 +1076,7 @@ async def health(request: Request):
         preferred_host=request.url.hostname,
         scheme=request.url.scheme or "http",
     )
+    snapshot = await run_in_threadpool(model_snapshot, include_capabilities=True)
     return {
         "status": "ok",
         "service": app.title,
@@ -1038,7 +1085,9 @@ async def health(request: Request):
             "port": resolve_request_port(request),
             "access_urls": access_urls,
         },
-        "models": available_model_ids(),
+        "models": snapshot["model_ids"],
+        "model_source": snapshot["source"],
+        "capabilities": snapshot["capabilities"],
     }
 
 
@@ -1126,9 +1175,10 @@ async def audio_speech_alias(request: AudioSpeechRequest):
 
 @app.get("/v1/models")
 async def list_models():
+    snapshot = await run_in_threadpool(model_snapshot)
     return {
         "object": "list",
-        "data": available_models()
+        "data": snapshot["models"]
     }
 
 

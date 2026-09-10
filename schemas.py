@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 REASONING_EFFORT_ALIASES = {
@@ -32,6 +32,18 @@ def normalize_reasoning_effort(value: Optional[str]) -> Optional[str]:
 
 class OpenAICompatModel(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+
+class ExplicitModelRequest(OpenAICompatModel):
+    """Request that must name a model itself: the bridge never guesses one."""
+
+    @field_validator("model", check_fields=False)
+    @classmethod
+    def validate_model(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("model must be a non-empty model id")
+        return normalized
 
 
 MessageContent = Optional[Union[str, Dict[str, Any], List[Union[str, Dict[str, Any]]]]]
@@ -113,8 +125,8 @@ class ResponsesRequest(OpenAICompatModel):
     user: Optional[str] = None
 
 
-class ImageGenerationRequest(OpenAICompatModel):
-    model: str = "gpt-image-2"
+class ImageGenerationRequest(ExplicitModelRequest):
+    model: str = Field(min_length=1)
     prompt: str
     n: Optional[int] = 1
     size: Optional[str] = "1024x1024"
@@ -130,8 +142,8 @@ class ImageGenerationRequest(OpenAICompatModel):
     user: Optional[str] = None
 
 
-class AudioSpeechRequest(OpenAICompatModel):
-    model: str = "gpt-4o-mini-tts"
+class AudioSpeechRequest(ExplicitModelRequest):
+    model: str = Field(min_length=1)
     input: str
     voice: Optional[str] = "marin"
     instructions: Optional[str] = None
