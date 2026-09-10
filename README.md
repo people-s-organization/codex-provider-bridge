@@ -188,6 +188,7 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 - `reasoning_effort` 和 `reasoning.effort` 支持 `low` / `medium` / `high` / `xhigh`，也兼容 `extra high`
 - `response_format={"type":"json_object"}` 和常见 `json_schema` 会被转换成额外 instructions，引导上游返回纯 JSON
 - `/v1/responses` 的 `text.format.type=json_schema` 会被转换成额外 instructions，引导上游返回符合 schema 的纯 JSON
+- 多轮对话的 content part 会按角色重新定型：assistant 轮次只发 `output_text` / `refusal`，user 轮次只发 `input_text` / `input_image`。上游对 assistant 轮次收到 `input_text` 会整包报 `Invalid value: 'input_text'`，所以 `/v1/responses` 的 `input` 里客户端自己传的 message item 也会做同样归一化（其他 item 类型原样透传）
 - 错误响应统一成 OpenAI 风格的 `{ "error": { "message", "type", "param", "code" } }`
 
 尽量兼容但不能完全等价的地方：

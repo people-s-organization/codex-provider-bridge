@@ -157,32 +157,45 @@ class ChatGPTBridge:
 
         return "\n".join(part for part in text_parts if part).strip()
 
-    def _content_to_codex_items(self, content: Any) -> list[dict[str, Any]]:
+    def _content_to_codex_items(self, content: Any, role: str = "user") -> list[dict[str, Any]]:
+        """Convert OpenAI content into Codex Responses input content.
+
+        The role decides the part type: the Codex backend only accepts ``output_text``
+        and ``refusal`` inside an assistant turn, and ``input_text`` / ``input_image``
+        inside a user turn. Sending ``input_text`` for an assistant message makes the
+        upstream reject the whole payload with ``Invalid value: 'input_text'``.
+        """
+
+        is_assistant = role == "assistant"
+        text_type = "output_text" if is_assistant else "input_text"
+
         if content is None:
             return []
         if isinstance(content, str):
-            return [{"type": "input_text", "text": content}]
+            return [{"type": text_type, "text": content}]
         if isinstance(content, dict):
             content = [content]
         if not isinstance(content, list):
-            return [{"type": "input_text", "text": str(content)}]
+            return [{"type": text_type, "text": str(content)}]
 
         items: list[dict[str, Any]] = []
         for part in content:
             if isinstance(part, str):
-                items.append({"type": "input_text", "text": part})
+                items.append({"type": text_type, "text": part})
                 continue
             if not isinstance(part, dict):
-                items.append({"type": "input_text", "text": str(part)})
+                items.append({"type": text_type, "text": str(part)})
                 continue
 
             part_type = part.get("type")
             if part_type in {"text", "input_text", "output_text"} and part.get("text") is not None:
-                item_type = "output_text" if part_type == "output_text" else "input_text"
-                items.append({"type": item_type, "text": str(part["text"])})
+                items.append({"type": text_type, "text": str(part["text"])})
                 continue
             if part_type == "refusal" and part.get("refusal") is not None:
-                items.append({"type": "input_text", "text": str(part["refusal"])})
+                if is_assistant:
+                    items.append({"type": "refusal", "refusal": str(part["refusal"])})
+                else:
+                    items.append({"type": "input_text", "text": str(part["refusal"])})
                 continue
             if part_type in {"image_url", "input_image"}:
                 image_url = part.get("image_url")
@@ -191,7 +204,11 @@ class ChatGPTBridge:
                     detail = detail or image_url.get("detail")
                     image_url = image_url.get("url")
                 image_url = image_url or part.get("url")
-                if image_url:
+                if not image_url:
+                    continue
+                if is_assistant:
+                    items.append({"type": "output_text", "text": f"[image: {image_url}]"})
+                else:
                     item = {"type": "input_image", "image_url": image_url}
                     if detail:
                         item["detail"] = detail
@@ -200,15 +217,48 @@ class ChatGPTBridge:
             if part_type in {"input_audio", "audio"}:
                 items.append(
                     {
-                        "type": "input_text",
+                        "type": text_type,
                         "text": "[audio input omitted: unsupported by the Codex text bridge]",
                     }
                 )
                 continue
 
-            items.append({"type": "input_text", "text": json.dumps(part, ensure_ascii=False)})
+            items.append({"type": text_type, "text": json.dumps(part, ensure_ascii=False)})
 
-        return items or [{"type": "input_text", "text": ""}]
+        return items or [{"type": text_type, "text": ""}]
+
+    def _normalize_responses_input_items(self, request_input: Any) -> Any:
+        """Fix role/content part types on client-supplied ``/v1/responses`` input.
+
+        Clients normally send ``input_text`` for every message, which the Codex backend
+        rejects as soon as an assistant turn is present. Message items are rewritten
+        with the same role rules as the chat completions path; every other item type is
+        passed through untouched.
+        """
+
+        if not isinstance(request_input, list):
+            return request_input
+
+        normalized: list[Any] = []
+        for item in request_input:
+            if not isinstance(item, dict):
+                normalized.append(item)
+                continue
+
+            role = str(item.get("role") or "").strip().lower()
+            if role not in {"user", "assistant", "system", "developer"} or "content" not in item:
+                normalized.append(item)
+                continue
+
+            if role in {"system", "developer"}:
+                role = "user"
+
+            normalized_item = dict(item)
+            normalized_item["role"] = role
+            normalized_item["content"] = self._content_to_codex_items(item.get("content"), role)
+            normalized.append(normalized_item)
+
+        return normalized
 
     def _message_to_response_input_item(self, message: Message) -> dict[str, Any] | None:
         if message.role == "tool":
@@ -219,11 +269,11 @@ class ChatGPTBridge:
             }
 
         role = "assistant" if message.role == "assistant" else "user"
-        content = self._content_to_codex_items(message.content)
+        content = self._content_to_codex_items(message.content, role)
         if message.tool_calls:
             content.append(
                 {
-                    "type": "input_text",
+                    "type": "output_text" if role == "assistant" else "input_text",
                     "text": (
                         "[assistant tool_calls omitted: OpenAI tool calling is not exposed "
                         "by the Codex backend bridge]"
@@ -387,7 +437,7 @@ class ChatGPTBridge:
                 }
             ]
         else:
-            request_input = request.input
+            request_input = self._normalize_responses_input_items(request.input)
 
         instructions = self._augment_instructions_for_schema(
             request.instructions,
