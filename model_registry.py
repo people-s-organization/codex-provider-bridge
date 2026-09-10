@@ -328,9 +328,11 @@ def capabilities() -> dict[str, Any]:
         "tool_calling": {
             "available": False,
             "scope": "bridge",
+            "upstream_supports_function_tools": True,
             "detail": (
-                "Client tools/functions are not forwarded upstream and the bridge never "
-                "emits tool_calls: text answers only, no file/command execution."
+                "The Codex responses upstream accepts custom function tools and returns "
+                "function_call items (verified), but this bridge neither forwards client "
+                "tools nor emits tool_calls: text answers only for now."
             ),
         },
     }

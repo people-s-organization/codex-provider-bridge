@@ -401,15 +401,15 @@ class ChatGPTBridge:
         if required_tool or required_function:
             return {
                 "status": 501,
-                "error": "OpenAI tool calling is not supported by the Codex backend bridge",
+                "error": "Tool calling is not implemented by this bridge",
                 "type": "unsupported_feature",
                 "param": "tool_choice",
                 "code": "unsupported_tool_calling",
                 "detail": (
-                    "ChatGPT/Codex subscription auth exposes the Codex responses channel, "
-                    "but this bridge cannot faithfully emit OpenAI tool_calls/function_call "
-                    "messages through that channel. Use tool_choice='none'/'auto' without "
-                    "requiring a call, or proxy this request with OPENAI_API_KEY."
+                    "The upstream Codex responses channel does accept custom function tools "
+                    "(verified), but this bridge does not forward client tools or emit "
+                    "tool_calls yet. Use tool_choice='none'/'auto' without requiring a call, "
+                    "or proxy this request with OPENAI_API_KEY."
                 ),
             }
         return None
@@ -476,9 +476,9 @@ class ChatGPTBridge:
         if request.tools or request.functions:
             instructions = (
                 f"{instructions}\n\n"
-                "Compatibility note: OpenAI tools/functions were supplied, but this bridge "
-                "cannot faithfully emit tool_calls through the Codex backend. Answer directly "
-                "unless the user explicitly asks for a machine-readable tool payload."
+                "Compatibility note: tools/functions were supplied, but this bridge does not "
+                "implement tool calling yet, so no tool_calls can be requested. Answer directly "
+                "and do not claim to have executed any tool."
             )
 
         payload: dict[str, Any] = {
@@ -540,8 +540,9 @@ class ChatGPTBridge:
         if request.tools:
             instructions = (
                 f"{instructions}\n\n"
-                "Compatibility note: tools were supplied, but OpenAI Responses tool-calling "
-                "is not exposed by this bridge when using ChatGPT/Codex subscription auth."
+                "Compatibility note: tools were supplied, but this bridge does not implement "
+                "tool calling yet, so no tool calls can be requested. Answer directly and do "
+                "not claim to have executed any tool."
             )
 
         payload: dict[str, Any] = {

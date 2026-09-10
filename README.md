@@ -187,7 +187,18 @@ API Key 一般可以随便填一个占位值，是否必须填写取决于你的
 - 因此：Agent 客户端接上这个桥能拿到**文字回答**，但拿不到 `tool_calls`，也就无法据此读文件、改代码、执行命令。**能聊天 ≠ 具备完整开发能力。**
 - 「历史重放」不等于「有工具能力」：桥会把客户端历史里已有的 `tool_calls` / `role:"tool"` 结果按上游格式重放（见下），那只是**入站兼容**，不代表模型能发起新的工具调用。
 - 目前唯一真正被上游执行过的工具是图片生成（`image_generation`），它由桥内部发起，不暴露给客户端。
-- 待验证项（不要当成已支持）：Codex responses 通道**能**接受 tools 数组并执行内置工具（图片生成即为例证），但**自定义函数工具是否被该通道接受尚未验证**，所以在验证之前这里不承诺可以打通。
+
+#### 上游能力已实测：支持自定义函数工具（但桥还没实现）
+
+2026-09-10 对 `POST $CHATGPT_BASE_URL/backend-api/codex/responses` 做了对照实验，结论是**限制在桥这边，不在上游**：
+
+| 实验 | 请求 | 结果 |
+|---|---|---|
+| A | `tools:[{"type":"function","name":"get_weather","parameters":{...}}]` + `tool_choice:"auto"` | **200**，流里出现 `response.function_call_arguments.delta/done` 与 `response.output_item.done`，item 为 `{"type":"function_call","name":"get_weather","call_id":"call_OVk92rrcFvqR6ij1GbcjawKR","arguments":"{\"city\":\"Paris\"}"}`，无正文 |
+| B | 同上但 `tool_choice:"required"` | **200**，同样返回 `function_call` |
+| C | 回放该 `function_call` + `function_call_output: "18C and sunny"` 再提问 | **200**，正文 `The weather in Paris right now is 18°C and sunny.` |
+
+也就是说**完整的工具调用闭环（模型发起调用 → 客户端执行 → 回填结果 → 模型作答）在上游是通的**，缺的是桥的转发与解析。把这条写在这里是为了不再出现"以为支持 / 以为不支持"的误判；在真正实现之前，**通过本桥依然拿不到 `tool_calls`**，`/health` 的 `capabilities.tool_calling` 也仍然返回 `available: false`（`scope: bridge`）。
 
 ### 文本接口
 
