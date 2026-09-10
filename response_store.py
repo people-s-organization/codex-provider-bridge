@@ -7,6 +7,7 @@ together with the conversation items that led to them. Nothing is written to dis
 record survives a restart, and a stored record is only readable through this process.
 """
 import os
+from copy import deepcopy
 import threading
 import time
 from collections import OrderedDict
@@ -69,8 +70,8 @@ class ResponseStore:
         if not response_id:
             return None
         entry = {
-            "response": response,
-            "conversation": list(conversation or []),
+            "response": deepcopy(response),
+            "conversation": deepcopy(list(conversation or [])),
             "expires_at": self._now() + self._ttl_seconds,
         }
         with self._lock:
@@ -91,7 +92,7 @@ class ResponseStore:
                 self._entries.pop(response_id, None)
                 return None
             self._entries.move_to_end(response_id)
-            return entry["response"]
+            return deepcopy(entry["response"])
 
     def conversation(self, response_id: str) -> list[Any] | None:
         """Return the ordered input items a follow-up turn must replay, or None."""
@@ -107,7 +108,7 @@ class ResponseStore:
                 self._entries.pop(response_id, None)
                 return None
             self._entries.move_to_end(response_id)
-            return list(entry["conversation"])
+            return deepcopy(entry["conversation"])
 
     def delete(self, response_id: str) -> bool:
         with self._lock:

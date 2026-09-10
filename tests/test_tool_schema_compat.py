@@ -1,10 +1,7 @@
-"""Tool-schema compatibility with real harness traffic (DeepSeek Harness / pi-ai).
+"""Synthetic harness-shaped schema regressions, not real DSH execution evidence.
 
-pi-ai serialises every harness tool as a flat ``{"type": "function", ...}`` definition
-and sends ``strict: false`` unless a tool explicitly asks for JSON-schema constrained
-sampling. The backend rejects ``strict: true`` unless every object node forbids extra
-properties and requires every declared property, so the bridge downgrades instead of
-failing the whole request.
+Strict sampling and schemas must survive translation unchanged. Unsupported dialect
+features are rejected by the upstream, never silently downgraded by the bridge.
 """
 import pytest
 
@@ -62,7 +59,7 @@ def test_strict_is_kept_when_the_schema_already_qualifies():
     assert request.compatibility_warnings() == []
 
 
-def test_strict_is_dropped_with_a_warning_when_the_schema_cannot_be_strict():
+def test_strict_is_preserved_for_upstream_validation():
     tool = nested_todo_tool(strict=True)
     # A property missing from required makes the backend reject the entire request.
     tool["parameters"]["properties"]["note"] = {"type": "string"}
@@ -70,19 +67,19 @@ def test_strict_is_dropped_with_a_warning_when_the_schema_cannot_be_strict():
     payload = ChatGPTBridge()._build_payload(request)
 
     assert payload["tools"][0]["name"] == "todo_write"
-    assert "strict" not in payload["tools"][0]
+    assert payload["tools"][0]["strict"] is True
     assert payload["tools"][0]["parameters"]["properties"]["note"] == {"type": "string"}
     warnings = request.compatibility_warnings()
-    assert len(warnings) == 1 and "strict mode was dropped for tool 'todo_write'" in warnings[0]
+    assert warnings == []
 
 
-def test_strict_is_dropped_when_a_nested_object_allows_extra_properties():
+def test_nested_schema_is_not_rewritten():
     tool = nested_todo_tool(strict=True)
     tool["parameters"]["properties"]["todos"]["items"]["additionalProperties"] = True
     request = chat([tool])
     payload = ChatGPTBridge()._build_payload(request)
-    assert "strict" not in payload["tools"][0]
-    assert any("strict mode was dropped" in warning for warning in request.compatibility_warnings())
+    assert payload["tools"][0]["strict"] is True
+    assert request.compatibility_warnings() == []
 
 
 def test_responses_tools_get_the_same_strict_treatment():
@@ -93,8 +90,8 @@ def test_responses_tools_get_the_same_strict_treatment():
     tool["parameters"]["required"] = []
     request = ResponsesRequest(model="gpt-fixture-a", input="hi", tools=[{"type": "function", **tool}])
     payload = ChatGPTBridge()._build_responses_payload(request)
-    assert "strict" not in payload["tools"][0]
-    assert any("strict mode was dropped" in warning for warning in request.compatibility_warnings())
+    assert payload["tools"][0]["strict"] is True
+    assert request.compatibility_warnings() == []
 
 
 @pytest.mark.parametrize("keywords", [

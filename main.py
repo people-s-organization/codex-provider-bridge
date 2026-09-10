@@ -1624,7 +1624,10 @@ def with_compatibility_warnings(handler):
         if warnings:
             if not isinstance(result, Response):
                 result = JSONResponse(content=result)
-            result.headers["X-Bridge-Compatibility-Warnings"] = "; ".join(warnings)
+            value = "; ".join(warnings).encode("ascii", "backslashreplace").decode("ascii")
+            result.headers["X-Bridge-Compatibility-Warnings"] = "".join(
+                char if 32 <= ord(char) <= 126 else " " for char in value
+            )[:4096]
         return result
     return wrapped
 
@@ -1633,6 +1636,9 @@ def with_compatibility_warnings(handler):
 @with_compatibility_warnings
 async def responses(request: ResponsesRequest):
     if request.stream:
+        error = bridge.previous_response_error(request)
+        if error:
+            return upstream_error_to_response(error)
         return StreamingResponse(
             stream_with_keepalive(bridge.responses_stream(request)),
             media_type="text/event-stream",

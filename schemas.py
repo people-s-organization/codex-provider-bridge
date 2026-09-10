@@ -4,7 +4,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 
 def validate_function_name(name):
@@ -141,8 +141,9 @@ def validate_call(call):
         raise ValueError("function call arguments must be a JSON object string")
 
 
-def validate_response_history(items):
-    pending, seen = set(), set()
+def validate_response_history(items, *, defer_pairing=False):
+    """Validate structure; defer cross-turn pairing until stored context is loaded."""
+    pending, seen, outputs = set(), set(), set()
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("history items must be objects")
@@ -160,12 +161,15 @@ def validate_response_history(items):
             seen.add(call_id)
         elif kind == "function_call_output":
             call_id = item.get("call_id")
-            if not isinstance(call_id, str) or call_id not in pending:
+            if not isinstance(call_id, str) or not call_id.strip() or call_id in outputs:
+                raise ValueError("orphan or duplicate function call output")
+            if not defer_pairing and call_id not in pending:
                 raise ValueError("orphan or duplicate function call output")
             if "output" not in item or not isinstance(item["output"], (str, list)):
                 raise ValueError("function call output must be a string or content array")
-            pending.remove(call_id)
-    if pending:
+            outputs.add(call_id)
+            pending.discard(call_id)
+    if pending and not defer_pairing:
         raise ValueError("function calls require matching outputs before a new model turn")
 
 
@@ -201,20 +205,20 @@ class OpenAICompatModel(BaseModel):
 
 
 class GenerationRequest(OpenAICompatModel):
-    # Compatibility notes discovered while building the upstream request (for example a
-    # tool downgraded out of strict mode). Surfaced through the warning header.
-    bridge_warnings: List[str] = Field(default_factory=list, exclude=True)
+    # Internal notes only: request JSON cannot populate this private list.
+    # Header-bound notes must be available before a streaming response starts.
+    _bridge_warnings: List[str] = PrivateAttr(default_factory=list)
 
     def add_bridge_warning(self, message: str) -> None:
-        if message not in self.bridge_warnings:
-            self.bridge_warnings.append(message)
+        if message not in self._bridge_warnings:
+            self._bridge_warnings.append(message)
 
     def ignored_parameter_warnings(self) -> List[str]:
         ignored = {"max_tokens", "max_completion_tokens", "max_output_tokens", "truncation", "temperature", "top_p", "stop", "presence_penalty", "frequency_penalty", "logit_bias", "seed", "user", "service_tier", "metadata", "logprobs", "top_logprobs", "best_of", "suffix", "echo"}
         return [f"{key} is ignored by the Codex bridge" for key in sorted(self.model_fields_set & ignored) if getattr(self, key, None) is not None]
 
     def compatibility_warnings(self) -> List[str]:
-        return [*self.ignored_parameter_warnings(), *self.bridge_warnings]
+        return [*self.ignored_parameter_warnings(), *self._bridge_warnings]
 
     @model_validator(mode="after")
     def validate_compatibility(self):
@@ -240,7 +244,7 @@ class GenerationRequest(OpenAICompatModel):
         if hasattr(self, "messages"):
             validate_response_history(chat_history_items(self.messages))
         elif isinstance(getattr(self, "input", None), list):
-            validate_response_history(self.input)
+            validate_response_history(self.input, defer_pairing=previous_response_id is not None)
         return self
 
 

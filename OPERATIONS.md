@@ -46,6 +46,17 @@ Explicit options the subscription endpoint cannot honor produce
 `X-Bridge-Compatibility-Warnings`. Set `BRIDGE_STRICT_COMPATIBILITY=true` to reject instead.
 No character clipping is presented as a token budget.
 
+Function-tool `strict` and parameter schemas are preserved unchanged, including in
+strict compatibility mode. The bridge does not downgrade strict sampling or attempt
+to duplicate the upstream schema dialect checker. An unsupported strict schema can
+therefore produce a genuine upstream error (inside SSE if headers already started).
+Warnings for ignored request parameters are computed before stream headers are sent.
+
+Synthetic harness-shaped schema tests are not evidence that every installed DSH tool
+has executed successfully. The surface checker reports PASS, FAIL and SKIP separately;
+a skipped authentication check is not a pass. Native Responses streams terminate with
+Responses terminal events; Chat Completions streams use `[DONE]`.
+
 ## Upstream transport
 
 Connection pooling is bounded by `UPSTREAM_MAX_CONNECTIONS` (32). Configure

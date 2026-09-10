@@ -9,7 +9,7 @@ Usage:
     .venv/bin/python scripts/openai_surface_check.py [--endpoint URL] [--key KEY]
                                                      [--model ID] [--json]
 
-Exit code 0 only when every check passes. Optional/deployment-dependent checks
+Exit code 0 when no check fails (skipped checks are not passes). Optional/deployment-dependent checks
 (media credentials, auth) are reported as SKIP instead of failing.
 """
 import argparse
@@ -276,7 +276,9 @@ def main():
         for result in checker.results:
             mark = "PASS" if result["ok"] else "SKIP" if result["ok"] is None else "FAIL"
             print(f"[{mark}] {result['check']}" + (f"  ({result['detail']})" if result["detail"] and mark != "PASS" else ""))
-        print(f"\n{len(checker.results) - len(failed)}/{len(checker.results)} checks passed, {len(failed)} failed")
+        passed = sum(result["ok"] is True for result in checker.results)
+        skipped = sum(result["ok"] is None for result in checker.results)
+        print(f"\n{passed} passed, {len(failed)} failed, {skipped} skipped ({len(checker.results)} total)")
     return 1 if failed else 0
 
 

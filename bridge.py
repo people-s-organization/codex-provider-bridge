@@ -98,42 +98,6 @@ class ToolCallAccumulator:
         return self._call_for(event), action
 
 
-def _strict_schema_compatible(schema: Any) -> bool:
-    """Whether a JSON Schema satisfies the backend's strict function-tool rules.
-
-    Strict sampling requires every object node to forbid extra properties and to list
-    every declared property in ``required``. The backend rejects the whole request
-    otherwise ("'required' is required to be supplied and to be an array including
-    every key in properties"), so the bridge checks before forwarding ``strict``.
-    """
-
-    if isinstance(schema, list):
-        return all(_strict_schema_compatible(item) for item in schema)
-    if not isinstance(schema, dict):
-        return True
-
-    properties = schema.get("properties")
-    if isinstance(properties, dict):
-        if schema.get("additionalProperties") is not False:
-            return False
-        required = schema.get("required")
-        if not isinstance(required, list) or set(properties) - set(required):
-            return False
-
-    # "properties"/"$defs"/"definitions" map names to schemas; the rest hold schemas.
-    for key in ("properties", "$defs", "definitions"):
-        value = schema.get(key)
-        if isinstance(value, dict) and not all(
-            _strict_schema_compatible(child) for child in value.values()
-        ):
-            return False
-    for key in ("items", "additionalProperties", "oneOf", "anyOf", "allOf", "prefixItems",
-                "not", "if", "then", "else"):
-        if key in schema and not _strict_schema_compatible(schema[key]):
-            return False
-    return True
-
-
 class ChatGPTBridge:
     def __init__(self):
         self.base_url = settings.chatgpt_base_url.rstrip("/")
@@ -478,28 +442,14 @@ class ChatGPTBridge:
         shape. Only client-executed ``function`` tools are supported; all other types
         fail validation explicitly.
 
-        ``strict: true`` is only forwarded when the schema already satisfies the strict
-        sampling rules the backend enforces (``additionalProperties: false`` and every
-        property listed in ``required``, at every level). Otherwise the tool is still
-        forwarded without ``strict`` and a warning is reported, because failing the whole
-        request over an optional guarantee would break ordinary tool use.
+        Preserve strict sampling exactly as requested. The upstream owns its schema
+        dialect and must reject unsupported schemas rather than the bridge silently
+        removing a caller's guarantee.
         """
 
         from schemas import normalize_tools
 
-        forwarded = normalize_tools(tools)
-        warnings: list[str] = []
-        for definition in forwarded:
-            if not definition.get("strict"):
-                continue
-            if _strict_schema_compatible(definition.get("parameters")):
-                continue
-            definition.pop("strict", None)
-            warnings.append(
-                f"strict mode was dropped for tool '{definition.get('name')}': the schema "
-                "does not set additionalProperties false and require every property"
-            )
-        return forwarded, warnings
+        return normalize_tools(tools), []
 
     def _normalize_tool_choice(self, tool_choice: Any, function_call: Any = None) -> Any:
         """Map Chat Completions / Responses tool_choice onto the Codex shape."""
@@ -654,20 +604,27 @@ class ChatGPTBridge:
         return f"{base}\n\n{schema_instruction}"
 
     def _responses_turn_items(self, request: ResponsesRequest) -> tuple[str | None, list[Any]]:
-        """Instruction text and input items for one Responses turn (without chaining)."""
+        """Normalize and validate the complete replay, not an isolated continuation."""
 
         if request.input is None:
-            # Only valid together with previous_response_id; chaining supplies the rest.
-            return None, []
-        if isinstance(request.input, str):
-            return None, [
+            items = []
+        elif isinstance(request.input, str):
+            items = [
                 {
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": request.input}],
                 }
             ]
-        return self._normalize_responses_input_items(request.input)
+        else:
+            items = request.input
+        previous_id = str(getattr(request, "previous_response_id", None) or "").strip()
+        if previous_id:
+            previous = response_store.conversation(previous_id)
+            if previous is None:
+                raise ValueError(f"Previous response with id '{previous_id}' not found.")
+            items = previous + list(items)
+        return self._normalize_responses_input_items(items)
 
     def model_not_found_error(self, requested_model: str) -> dict[str, Any] | None:
         """Mirror the real API's 404 for a model this account cannot use.
@@ -693,7 +650,7 @@ class ChatGPTBridge:
         }
 
     def previous_response_error(self, request: ResponsesRequest) -> dict[str, Any] | None:
-        """Reject an unknown ``previous_response_id`` the way the real API does."""
+        """Preflight prior-response lookup and combined history before streaming."""
 
         previous_id = str(getattr(request, "previous_response_id", None) or "").strip()
         if not previous_id:
@@ -707,14 +664,14 @@ class ChatGPTBridge:
                 "code": "previous_response_not_found",
                 "error": f"Previous response with id '{previous_id}' not found.",
             }
+        try:
+            self._responses_turn_items(request)
+        except ValueError as exc:
+            return self._response_history_error(exc)
         return None
 
     def _build_responses_payload(self, request: ResponsesRequest) -> dict[str, Any]:
         replayed_instructions, request_input = self._responses_turn_items(request)
-        previous_id = str(getattr(request, "previous_response_id", None) or "").strip()
-        if previous_id:
-            # Stateless upstream: replay the stored conversation before the new turn.
-            request_input = list(response_store.conversation(previous_id) or []) + list(request_input)
 
         instruction_parts = [part for part in (request.instructions, replayed_instructions) if part]
         instructions = self._augment_instructions_for_schema(
@@ -839,18 +796,17 @@ class ChatGPTBridge:
         async for chunk in chat_completion_stream(self, request):
             yield chunk
 
-    def remember_response(self, request: ResponsesRequest, response: dict[str, Any]) -> None:
+    def remember_response(
+        self, request: ResponsesRequest, response: dict[str, Any],
+        replay_items: list[Any] | None = None,
+    ) -> None:
         """Store a completed response plus the conversation it belongs to."""
 
         if not getattr(request, "store", True):
             return
-        previous_id = str(getattr(request, "previous_response_id", None) or "").strip()
-        chained = list(response_store.conversation(previous_id) or []) if previous_id else []
-        try:
-            _, turn_items = self._responses_turn_items(request)
-        except ValueError:
-            turn_items = []
-        conversation = chained + list(turn_items) + list(response.get("output") or [])
+        if replay_items is None:
+            _, replay_items = self._responses_turn_items(request)
+        conversation = list(replay_items) + list(response.get("output") or [])
         response["store"] = True
         response_store.store(response, conversation)
 
@@ -860,9 +816,13 @@ class ChatGPTBridge:
         request_error = self.model_not_found_error(request.model) or self.previous_response_error(request)
         if request_error:
             return None, request_error
+        try:
+            _, replay_items = self._responses_turn_items(request)
+        except ValueError as exc:
+            return None, self._response_history_error(exc)
         result, error = await responses(self, request)
         if error is None and result is not None:
-            self.remember_response(request, result)
+            self.remember_response(request, result, replay_items)
         return result, error
 
     async def responses_stream(self, request: ResponsesRequest) -> AsyncGenerator[str, None]:
@@ -873,11 +833,27 @@ class ChatGPTBridge:
             yield f"event: error\ndata: {json.dumps(self._stream_error_event(request_error))}\n\n"
             return
 
+        try:
+            _, replay_items = self._responses_turn_items(request)
+        except ValueError as exc:
+            yield f"event: error\ndata: {json.dumps(self._stream_error_event(self._response_history_error(exc)))}\n\n"
+            return
+
         def on_complete(response: dict[str, Any]) -> None:
-            self.remember_response(request, response)
+            self.remember_response(request, response, replay_items)
 
         async for chunk in responses_stream(self, request, on_complete=on_complete):
             yield chunk
+
+    def _response_history_error(self, exc: ValueError) -> dict[str, Any]:
+        return {
+            "status": 400,
+            "local": True,
+            "type": "invalid_request_error",
+            "param": "input",
+            "code": "invalid_value",
+            "error": str(exc),
+        }
 
     def _missing_response_error(self, response_id: str) -> dict[str, Any]:
         return {
