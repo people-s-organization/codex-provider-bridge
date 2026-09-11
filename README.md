@@ -1,5 +1,7 @@
 # Codex Provider Bridge
 
+**简体中文** | [English](README.en.md)
+
 将 ChatGPT Web / Codex 登录态桥接为尽量兼容 OpenAI 的本地接口，供 DeepSeek Harness、OpenClaw、Hermes 等支持 OpenAI 兼容接口的 Agent 使用。
 
 项目会对接 ChatGPT 的 `codex/responses` 通道，并暴露常见的 OpenAI 风格路由：
