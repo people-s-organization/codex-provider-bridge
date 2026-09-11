@@ -1,10 +1,10 @@
 # Codex Provider Bridge
 
-**简体中文** | [English](README.en.md)
+**English** | [简体中文](README.zh-CN.md)
 
-将 ChatGPT Web / Codex 登录态桥接为尽量兼容 OpenAI 的本地接口，供 DeepSeek Harness、OpenClaw、Hermes 等支持 OpenAI 兼容接口的 Agent 使用。
+Bridges a ChatGPT Web / Codex login session into a local interface that aims to be as OpenAI-compatible as possible, for agents such as DeepSeek Harness, OpenClaw, and Hermes that support OpenAI-compatible interfaces.
 
-项目会对接 ChatGPT 的 `codex/responses` 通道，并暴露常见的 OpenAI 风格路由：
+The project connects to ChatGPT's `codex/responses` channel and exposes common OpenAI-style routes:
 
 - `GET /v1/models`
 - `POST /v1/completions`
@@ -12,61 +12,61 @@
 - `POST /v1/chat/completions`
 - `POST /v1/images/generations`
 - `POST /v1/audio/speech`
-- 对应的非 `/v1` 别名：`/completions`、`/responses`、`/chat/completions`、`/images/generations`、`/audio/speech`
-- 已识别但订阅通道不支持的端点（如 embeddings、files）：配置 `OPENAI_API_KEY` 时代理到官方 OpenAI API，否则返回 `501 unsupported_endpoint`；未知路径始终返回 `404`
+- Corresponding non-`/v1` aliases: `/completions`, `/responses`, `/chat/completions`, `/images/generations`, `/audio/speech`
+- Recognized endpoints not supported by the subscription channel (such as embeddings and files): proxied to the official OpenAI API when `OPENAI_API_KEY` is configured; otherwise return `501 unsupported_endpoint`. Unknown paths always return `404`.
 - `GET /`
 - `GET /health`
 - `GET /routes`
 
-## 适用场景
+## Use Cases
 
-- 本地桌面环境：可用浏览器登录或已有 token 直接启动
-- 云主机 / SSH：推荐使用已有 token、`~/.codex/auth.json`，或纯 HTTP 的 device-code 登录
-- 局域网共享：默认只监听 `127.0.0.1`。对外监听前应设置 `BRIDGE_API_KEY`；只有明确接受无鉴权风险时才设置 `ALLOW_UNAUTHENTICATED_PUBLIC=true`
+- Local desktop: start with browser login or an existing token.
+- Cloud server / SSH: an existing token, `~/.codex/auth.json`, or pure-HTTP device-code login is recommended.
+- LAN sharing: listens only on `127.0.0.1` by default. Set `BRIDGE_API_KEY` before listening on a public-facing address; set `ALLOW_UNAUTHENTICATED_PUBLIC=true` only if you explicitly accept the risk of unauthenticated access.
 
-## 认证方式
+## Authentication Methods
 
-启动时按下面顺序尝试认证：
+At startup, authentication is attempted in this order:
 
-1. `.env` 中的 `CHATGPT_ACCESS_TOKEN`
-2. `~/.codex/auth.json` 中的 `access_token`
-3. 浏览器登录
-4. device-code 登录
+1. `CHATGPT_ACCESS_TOKEN` in `.env`
+2. `access_token` in `~/.codex/auth.json`
+3. Browser login
+4. Device-code login
 
-你可以通过命令行参数 `--auth` 控制偏好：
+You can control the preference with the `--auth` command-line argument:
 
-- `prompt`：默认值；在 1 和 2 都不存在时，启动时询问你使用浏览器登录还是 device-code
-- `auto`：自动行为；在交互式终端中，如果 1 和 2 都不存在，也会让你手动选择 3 或 4
-- `browser`：优先浏览器登录
-- `device`：直接走 device-code，适合云主机
+- `prompt`: the default; if neither 1 nor 2 is present, asks at startup whether to use browser login or device-code.
+- `auto`: automatic behavior; in an interactive terminal, if neither 1 nor 2 is present, also lets you manually choose 3 or 4.
+- `browser`: prefers browser login.
+- `device`: goes directly to device-code, suitable for cloud servers.
 
-如果你不传 `--auth`，默认就是 `prompt`。  
-同时也保留 `CHATGPT_AUTH_METHOD` 环境变量作为兼容兜底，但命令行参数优先级更高。
+If you do not pass `--auth`, the default is `prompt`.
+The `CHATGPT_AUTH_METHOD` environment variable is also retained as a compatibility fallback, but the command-line argument takes precedence.
 
-在 Linux 无图形环境中，如果当前不是交互式终端，`prompt` 会自动退化为推荐方式，通常是 device-code。
+On headless Linux, if the current terminal is not interactive, `prompt` automatically falls back to the recommended method, usually device-code.
 
-## 快速开始
+## Quick Start
 
-### 方式一：一键启动
+### Option 1: One-Step Startup
 
 ```bash
 chmod +x start.sh
 ./start.sh
 ```
 
-`start.sh` 会自动：
+`start.sh` automatically:
 
-1. 创建 `.venv`
-2. 安装依赖
-3. 启动服务
+1. Creates `.venv`
+2. Installs dependencies
+3. Starts the service
 
-如果你还需要桌面浏览器登录，可在首次启动前安装 Playwright 浏览器：
+If you also need desktop browser login, you can install the Playwright browser before the first startup:
 
 ```bash
 INSTALL_PLAYWRIGHT_BROWSER=1 ./start.sh
 ```
 
-如果你想显式指定认证方式：
+To explicitly specify the authentication method:
 
 ```bash
 ./start.sh --auth prompt
@@ -74,7 +74,7 @@ INSTALL_PLAYWRIGHT_BROWSER=1 ./start.sh
 ./start.sh --auth device
 ```
 
-### 方式二：手动启动
+### Option 2: Manual Startup
 
 ```bash
 python3 -m venv .venv
@@ -83,43 +83,43 @@ pip install -r requirements.txt
 python main.py --auth prompt
 ```
 
-## 云主机部署建议
+## Cloud Server Deployment Recommendations
 
-云主机上最推荐的顺序是：
+The recommended order on a cloud server is:
 
-1. 直接写入 `CHATGPT_ACCESS_TOKEN`
-2. 或复制 `~/.codex/auth.json`
-3. 或显式使用 `--auth device`
+1. Set `CHATGPT_ACCESS_TOKEN` directly
+2. Or copy `~/.codex/auth.json`
+3. Or explicitly use `--auth device`
 
-示例：
+Example:
 
 ```bash
 cp .env.example .env
 ./start.sh --auth device
 ```
 
-启动后终端会输出授权链接和授权码。你在自己的本地浏览器中打开链接、输入授权码，云主机这边会持续轮询并保存 token 到 `.env`。
+After startup, the terminal prints an authorization link and code. Open the link in your own local browser and enter the code; the cloud server keeps polling and saves the token to `.env`.
 
-如果你是通过 SSH 交互式启动，并且 `.env` / `~/.codex/auth.json` 都没有可用 token，那么默认的 `--auth prompt` 会先问你：
+If you start interactively over SSH and neither `.env` nor `~/.codex/auth.json` has a usable token, the default `--auth prompt` first asks you to choose:
 
-- 3. 浏览器登录
-- 4. device-code 登录
+- 3. Browser login
+- 4. Device-code login
 
-你可以当场手动选择。
+You can make the choice manually at that point.
 
-## 本地桌面部署建议
+## Local Desktop Deployment Recommendations
 
-如果你本机有浏览器环境，可以直接：
+If your local machine has a browser environment, simply run:
 
 ```bash
 ./start.sh
 ```
 
-没有现成 token 时，程序会尝试弹出浏览器登录。若浏览器登录失败，也会自动回退到 device-code。
+Without an existing token, the program attempts to open a browser for login. If browser login fails, it automatically falls back to device-code.
 
-## 配置项
+## Configuration
 
-可参考 [.env.example](./.env.example)：
+See [.env.example](./.env.example):
 
 ```env
 CHATGPT_ACCESS_TOKEN=
@@ -140,7 +140,7 @@ CHATGPT_MEDIA_MODEL=
 CHATGPT_REALTIME_MODEL=
 CHATGPT_MODELS_FILE=~/.codex/models_cache.json
 CHATGPT_CODEX_CONFIG_FILE=~/.codex/config.toml
-# 不设置则使用默认上游地址；显式设为空值会禁用对应发现。
+# If unset, the default upstream URL is used; explicitly setting an empty value disables the corresponding discovery.
 # CHATGPT_MODELS_URL=
 # CHATGPT_CAPABILITIES_URL=
 # CHATGPT_CLIENT_VERSION=
@@ -152,58 +152,58 @@ BRIDGE_CORS_ORIGINS=*
 STREAM_KEEPALIVE_SECONDS=15
 ```
 
-说明：
+Details:
 
-- `CHATGPT_ACCESS_TOKEN`：如果你已经有 token，填上后可直接启动
-- `OPENAI_API_KEY`：可选；图片和语音都优先走 ChatGPT/Codex 能力，只有对应能力失败或缺 token 时才用它兜底；已识别但未内置支持的端点也会用它代理到官方 OpenAI API，未知路径仍返回 404
-- `OPENAI_BASE_URL`：OpenAI API 地址，默认是 `https://api.openai.com`
-- `CHATGPT_ACCOUNT_ID`：可选；默认会从 `~/.codex/auth.json` 读取，realtime 语音握手会带上它
-- `CHATGPT_AUTH_METHOD`：兼容性兜底配置；可选 `prompt | auto | browser | device`
-- `HOST` / `PORT`：服务监听地址，默认 `127.0.0.1:8000`
-- `BRIDGE_API_KEY`：客户端访问桥的 Bearer 密钥；与上游 `OPENAI_API_KEY` 不同。配置后除 `/health` 等必要预检外，接口需要鉴权
-- `ALLOW_UNAUTHENTICATED_PUBLIC`：是否明确允许非 loopback 地址无鉴权监听，默认 `false`
-- `BRIDGE_STRICT_COMPATIBILITY`：对无法兑现的请求参数返回错误，而不是接受并通过告警头说明；不改变函数工具 `strict` 的透传语义
-- `CHATGPT_BASE_URL`：默认是 `https://chatgpt.com`
-- `CHATGPT_MODELS`：显式指定 `/v1/models` 返回的模型列表，支持逗号分隔或 JSON 数组；设置后不再读取缓存和上游
-- `CHATGPT_EXTRA_MODELS`：在自动模型列表后追加模型，例如刚发布但本地缓存还没刷新的模型
-- `CHATGPT_DEFAULT_MODEL`：首页测试表单默认选中的模型；不设置时用 `~/.codex/config.toml` 里的 `model`，再退到当前列表第一个
-- `CHATGPT_MEDIA_MODEL`：图片接口调用 Codex `image_generation` 工具时使用的上游 Responses 模型；不设置时按 `CHATGPT_DEFAULT_MODEL` → 请求里真实存在的 `model` → 探测到的默认模型解析（`gpt-image-*` 这类图片模型名不会被当成 Responses 模型，上游会直接拒绝）
-- `CHATGPT_REALTIME_MODEL`：语音接口调用 realtime WebSocket 时使用的模型；默认用请求里的 `model`
-- `CHATGPT_MODELS_FILE`：Codex 模型缓存路径，默认读取 `~/.codex/models_cache.json`
-- `CHATGPT_CODEX_CONFIG_FILE`：Codex 配置路径，默认读取 `~/.codex/config.toml` 中的 `model`
-- `CHATGPT_MODELS_URL`：缓存为空时向上游查询模型列表的地址，默认 `$CHATGPT_BASE_URL/backend-api/codex/models`；设为空值即关闭上游查询
-- `CHATGPT_CAPABILITIES_URL`：能力探测地址（ChatGPT web 模型列表，用 `enabled_tools` 标记图片工具），默认 `$CHATGPT_BASE_URL/backend-api/models`；设为空值即关闭能力探测
-- `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES`：模型别名映射，支持 JSON 对象或 `old=new,old2=new2`；默认不含任何别名
-- `BRIDGE_RESPONSE_STORE_MAX` / `BRIDGE_RESPONSE_STORE_TTL`：桥自存的 Responses 数量上限与过期秒数，仅进程内存储
-- `BRIDGE_CORS_ORIGINS`：允许的浏览器来源，逗号分隔；`*` 表示任意来源（此时不允许携带凭据）
-- `STREAM_KEEPALIVE_SECONDS`：SSE 空闲多少秒后发 `: ping` 注释行，0 关闭
+- `CHATGPT_ACCESS_TOKEN`: if you already have a token, enter it to start directly.
+- `OPENAI_API_KEY`: optional; images and speech both prefer ChatGPT/Codex capabilities, using this as a fallback only when the corresponding capability fails or a token is missing. Recognized endpoints without built-in support also use it to proxy to the official OpenAI API; unknown paths still return 404.
+- `OPENAI_BASE_URL`: OpenAI API address; defaults to `https://api.openai.com`.
+- `CHATGPT_ACCOUNT_ID`: optional; read from `~/.codex/auth.json` by default and included in the realtime speech handshake.
+- `CHATGPT_AUTH_METHOD`: compatibility fallback setting; accepts `prompt | auto | browser | device`.
+- `HOST` / `PORT`: service listening address; defaults to `127.0.0.1:8000`.
+- `BRIDGE_API_KEY`: Bearer key for client access to the bridge, distinct from the upstream `OPENAI_API_KEY`. Once configured, endpoints require authentication except for `/health` and necessary preflight requests.
+- `ALLOW_UNAUTHENTICATED_PUBLIC`: whether to explicitly allow listening on a non-loopback address without authentication; defaults to `false`.
+- `BRIDGE_STRICT_COMPATIBILITY`: returns errors for request parameters that cannot be honored, rather than accepting them and explaining via warning headers; does not change the pass-through semantics of function-tool `strict`.
+- `CHATGPT_BASE_URL`: defaults to `https://chatgpt.com`.
+- `CHATGPT_MODELS`: explicitly specifies the model list returned by `/v1/models`, as comma-separated values or a JSON array; when set, neither the cache nor upstream is read.
+- `CHATGPT_EXTRA_MODELS`: appends models to the automatically obtained list, such as newly released models not yet reflected in the local cache.
+- `CHATGPT_DEFAULT_MODEL`: model selected by default in the homepage test form; if unset, uses `model` from `~/.codex/config.toml`, then falls back to the first model in the current list.
+- `CHATGPT_MEDIA_MODEL`: upstream Responses model used when the image endpoint calls the Codex `image_generation` tool; if unset, resolves in this order: `CHATGPT_DEFAULT_MODEL` → a genuinely existing `model` from the request → the discovered default model. Image model names such as `gpt-image-*` are not treated as Responses models, as upstream would reject them outright.
+- `CHATGPT_REALTIME_MODEL`: model used when the speech endpoint calls the realtime WebSocket; defaults to the request's `model`.
+- `CHATGPT_MODELS_FILE`: Codex model cache path; defaults to `~/.codex/models_cache.json`.
+- `CHATGPT_CODEX_CONFIG_FILE`: Codex configuration path; by default reads `model` from `~/.codex/config.toml`.
+- `CHATGPT_MODELS_URL`: URL used to query upstream for the model list when the cache is empty; defaults to `$CHATGPT_BASE_URL/backend-api/codex/models`. Set to an empty value to disable upstream queries.
+- `CHATGPT_CAPABILITIES_URL`: capability-discovery URL (the ChatGPT web model list, which uses `enabled_tools` to flag image tools); defaults to `$CHATGPT_BASE_URL/backend-api/models`. Set to an empty value to disable capability discovery.
+- `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES`: model alias mappings, as a JSON object or `old=new,old2=new2`; no aliases are included by default.
+- `BRIDGE_RESPONSE_STORE_MAX` / `BRIDGE_RESPONSE_STORE_TTL`: maximum number of Responses stored by the bridge and expiry in seconds; in-process storage only.
+- `BRIDGE_CORS_ORIGINS`: allowed browser origins, comma-separated; `*` means any origin (credentials are not allowed in that case).
+- `STREAM_KEEPALIVE_SECONDS`: sends an SSE `: ping` comment line after this many idle seconds; 0 disables it.
 
-## 使用方式
+## Usage
 
-启动后打开首页：
+After startup, open the homepage:
 
 - `http://127.0.0.1:8000/`
-- 或首页展示的实际地址
+- Or the actual address displayed on the homepage
 
-如果默认端口被占用，程序会自动切到附近空闲端口，以启动日志及首页显示的实际监听地址为准；`/health` 仅返回最小健康信息。
+If the default port is occupied, the program automatically switches to a nearby available port. Use the actual listening address shown in the startup logs and on the homepage; `/health` returns only minimal health information.
 
-给 Agent 配置时，将 Base URL 指向：
+When configuring an agent, point its Base URL to:
 
 ```text
 http://<your-host>:<port>/v1
 ```
 
-若设置了 `BRIDGE_API_KEY`，客户端必须填写相同的密钥；未启用桥鉴权时，客户端若强制要求 API Key，可填占位值。不要把上游 ChatGPT access token 直接配置给客户端。
+If `BRIDGE_API_KEY` is set, the client must use the same key. If bridge authentication is disabled but the client requires an API Key, you may enter a placeholder. Do not configure the client directly with the upstream ChatGPT access token.
 
-运维参数、严格兼容模式、回滚部署与真实 Agent 验收见 [OPERATIONS.md](OPERATIONS.md)。
+For operational parameters, strict compatibility mode, rollback deployment, and real-agent acceptance testing, see [OPERATIONS.md](OPERATIONS.md).
 
-## DeepSeek Harness 接入与验证
+## DeepSeek Harness Integration and Verification
 
-在 DSH 的 provider 配置中使用 `api: openai-completions`，Base URL 指向本桥的 `/v1`（例如当前部署的 `http://127.0.0.1:8790/v1`；默认启动端口是 8000）。模型 ID 取自该桥实际返回的 `/v1/models`，API Key 按上面的桥鉴权配置填写。
+In the DSH provider configuration, use `api: openai-completions` and point the Base URL to this bridge's `/v1` (for example, the current deployment's `http://127.0.0.1:8790/v1`; the default startup port is 8000). Use a model ID actually returned by the bridge's `/v1/models`, and set the API Key according to the bridge authentication configuration above.
 
-DSH 的 bash、read、web_search 等是客户端执行的 function 工具；桥不需要按工具名字逐个实现。DSH 的名为 `web_search` 的函数与 provider 原生的 `type: web_search` 不是一回事：前者可以转发，后者不是当前支持的工具类型。
+DSH's bash, read, web_search, and similar tools are client-executed function tools; the bridge does not need to implement each tool by name. DSH's function named `web_search` is not the same as a provider-native `type: web_search`: the former can be forwarded, while the latter is not a currently supported tool type.
 
-可复验脚本（服务须已运行；端口不同请调整参数/环境变量）：
+Reproducible verification scripts (the service must already be running; adjust arguments/environment variables if using a different port):
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -212,123 +212,123 @@ DSH 的 bash、read、web_search 等是客户端执行的 function 工具；桥�
 DSH_RUNTIME=/path/to/dsh-runtime BRIDGE_BASE_URL=http://127.0.0.1:8790/v1 node scripts/dsh_tool_probe.mjs
 ```
 
-- 接口检查分别报告 PASS、FAIL、SKIP；未提供鉴权密钥时跳过鉴权检查，不能将跳过计为通过。
-- Responses 工具续链脚本执行固定加法，再用 `previous_response_id` 仅回填工具结果，检查模型是否消费结果。
-- DSH 探针加载**已安装的真实 `todo_write` 插件定义与执行代码**，经实际 pi-ai/OpenAI SDK 序列化和 SSE 解析完成两轮交互；工具执行仅写隔离的内存会话。详见 [scripts/DSH_PROBE.md](scripts/DSH_PROBE.md)。
-- 这不等于所有 DSH 工具逐个执行验收，也不是 GUI 活跃会话、权限系统和持久化的完整端到端验收。手写的 harness-shaped schema 测试仅是回归测试，不能替代上述证据。
+- The interface checks report PASS, FAIL, and SKIP separately; authentication checks are skipped when no authentication key is supplied, and skips must not be counted as passes.
+- The Responses tool-chain script performs a fixed addition, then submits only the tool result using `previous_response_id` to check whether the model consumes the result.
+- The DSH probe loads the **installed, real `todo_write` plugin definition and execution code**, completing two interaction rounds through actual pi-ai/OpenAI SDK serialization and SSE parsing; tool execution writes only to an isolated in-memory session. See [scripts/DSH_PROBE.md](scripts/DSH_PROBE.md).
+- This does not constitute execution-based acceptance testing of every DSH tool, nor complete end-to-end acceptance testing of an active GUI session, the permission system, and persistence. Handwritten harness-shaped schema tests are regression tests only and cannot replace the evidence above.
 
-## 接口兼容范围
+## API Compatibility Scope
 
-### OpenAI API 端点对照
+### OpenAI API Endpoint Comparison
 
-| 端点 | 状态 | 说明 |
+| Endpoint | Status | Notes |
 |---|---|---|
-| `GET /v1/models` | ✅ | 真实发现结果，无写死列表、无兜底 |
-| `GET /v1/models/{id}` | ✅ | 命中返回 model 对象，未命中 `404 model_not_found` |
-| `POST /v1/chat/completions` | ✅ | 文本、流式、工具调用、图片输入 |
-| `POST /v1/responses` | ✅ | 文本、流式、工具调用、`store`、`previous_response_id` |
-| `GET /v1/responses/{id}` | ✅ | 读取桥自存的响应（进程内，见下） |
-| `DELETE /v1/responses/{id}` | ✅ | 删除桥自存的响应 |
-| `POST /v1/completions` | ✅ | 旧 Completions 形状，映射到一次文本调用 |
-| `POST /v1/images/generations` | ✅ | Codex `image_generation` 工具；无凭据时 `501` |
-| `POST /v1/audio/speech` | ✅ | Codex realtime；无凭据时 `501` |
-| `POST /v1/responses/input_tokens` | ❌ | 订阅通道不提供 tokenizer，不返回编造的数字 |
-| `POST /v1/embeddings` / `moderations` | ❌ | 订阅通道不暴露这两个能力；配 `OPENAI_API_KEY` 时按原样代理 |
-| `files` / `batches` / `fine_tuning` / `vector_stores` / `assistants` | ❌ | 同上：无凭据时 `501 unsupported_endpoint`，有凭据时代理 |
-| `audio/transcriptions`、`audio/translations`、`images/edits`、`images/variations` | ❌ | 同上 |
+| `GET /v1/models` | ✅ | Actual discovery results, with no hardcoded list or fallback |
+| `GET /v1/models/{id}` | ✅ | Returns a model object on a match; otherwise `404 model_not_found` |
+| `POST /v1/chat/completions` | ✅ | Text, streaming, tool calls, image input |
+| `POST /v1/responses` | ✅ | Text, streaming, tool calls, `store`, `previous_response_id` |
+| `GET /v1/responses/{id}` | ✅ | Retrieves a response stored by the bridge (in-process; see below) |
+| `DELETE /v1/responses/{id}` | ✅ | Deletes a response stored by the bridge |
+| `POST /v1/completions` | ✅ | Legacy Completions shape, mapped to one text call |
+| `POST /v1/images/generations` | ✅ | Codex `image_generation` tool; `501` without credentials |
+| `POST /v1/audio/speech` | ✅ | Codex realtime; `501` without credentials |
+| `POST /v1/responses/input_tokens` | ❌ | The subscription channel provides no tokenizer; no fabricated numbers are returned |
+| `POST /v1/embeddings` / `moderations` | ❌ | The subscription channel exposes neither capability; proxied as-is when `OPENAI_API_KEY` is configured |
+| `files` / `batches` / `fine_tuning` / `vector_stores` / `assistants` | ❌ | Same as above: `501 unsupported_endpoint` without credentials, proxied with credentials |
+| `audio/transcriptions`, `audio/translations`, `images/edits`, `images/variations` | ❌ | Same as above |
 
-❌ 的端点不会返回假数据：没有真实能力就返回带原因的 `501`，配置 `OPENAI_API_KEY` 后原样代理到官方 API。未知路径返回 `404 Invalid URL (...)`，与官方行为一致。
+Endpoints marked ❌ do not return fake data: without a real capability, they return `501` with a reason; when `OPENAI_API_KEY` is configured, they are proxied as-is to the official API. Unknown paths return `404 Invalid URL (...)`, matching official behavior.
 
-### 协议层一致性
+### Protocol-Level Consistency
 
-- 请求校验失败返回 **`400`** + `{"error":{"message","type","param","code"}}`，`param` 指向出错字段；不回显完整请求体；部分错误会包含相关函数名或响应 ID。上游错误可附带经过截断和凭据脱敏的原因，不能视作完整的隐私脱敏保证。
-- 未知模型返回 **`404 model_not_found`**（仅当模型列表确实可用时判定；发现源为空时交给上游判断）。
-- `store` / `previous_response_id`：上游是无状态且拒绝 `store`，所以**桥自己**维护一个有界、过期、仅进程内的响应存储（`BRIDGE_RESPONSE_STORE_MAX`、`BRIDGE_RESPONSE_STORE_TTL`）。`store` 默认 `true`（与官方一致），`store:false` 时不存，之后用该 id 续链会得到 `404 previous_response_not_found`。重启即失效，多进程不共享；需要跨重启持久化就不要依赖它。
-- 流式响应是 `text/event-stream`，空闲超过 `STREAM_KEEPALIVE_SECONDS`（默认 15，0 关闭）会发 `: ping` 注释行，避免代理断流；Chat/旧 Completions 结束时发 `data: [DONE]`，原生 Responses 使用 `response.completed` 等终态事件，不要求 `[DONE]`。上游错误若发生在响应头发出后，会通过 SSE 错误事件报告，HTTP 200 本身不代表生成成功。
-- 浏览器直连可用：`BRIDGE_CORS_ORIGINS` 控制允许的来源（默认 `*`，配置具体来源时才允许凭据）。
-- 401 使用 `{"error":{"code":"invalid_api_key",...}}`，限流类上游错误保留状态码与 `Retry-After`。
+- Request validation failures return **`400`** + `{"error":{"message","type","param","code"}}`, with `param` identifying the invalid field. The full request body is not echoed; some errors include the relevant function name or response ID. Upstream errors may include a truncated reason with credentials redacted; this must not be treated as a guarantee of complete privacy redaction.
+- Unknown models return **`404 model_not_found`** (determined only when the model list is actually available; if discovery sources are empty, the decision is left to upstream).
+- `store` / `previous_response_id`: upstream is stateless and rejects `store`, so **the bridge itself** maintains a bounded, expiring, in-process-only response store (`BRIDGE_RESPONSE_STORE_MAX`, `BRIDGE_RESPONSE_STORE_TTL`). `store` defaults to `true` (matching the official API). With `store:false`, the response is not stored, and a later attempt to continue with that ID returns `404 previous_response_not_found`. Records are lost on restart and are not shared across processes; do not rely on this if you need persistence across restarts.
+- Streaming responses use `text/event-stream`. After more than `STREAM_KEEPALIVE_SECONDS` of inactivity (default 15; 0 disables it), a `: ping` comment line is sent to avoid proxy disconnections. Chat/legacy Completions send `data: [DONE]` at the end; native Responses use terminal events such as `response.completed` and do not require `[DONE]`. Upstream errors occurring after response headers have been sent are reported through SSE error events; HTTP 200 alone does not mean generation succeeded.
+- Direct browser access is supported: `BRIDGE_CORS_ORIGINS` controls allowed origins (default `*`; credentials are allowed only when specific origins are configured).
+- 401 uses `{"error":{"code":"invalid_api_key",...}}`; rate-limit-related upstream errors retain their status code and `Retry-After`.
 
-### 能力边界（先说清楚）
+### Capability Boundaries (Clarified Up Front)
 
-- ✅ **文本问答**：单轮、多轮、SSE 流式都可用；支持 `reasoning_effort` 和旧 Completions 形状。JSON 输出格式通过 instructions 引导，不保证服务端严格满足 schema。
-- ✅ **函数工具调用（function tool calling）**：`tools` / 旧版 `functions` 会转发给上游，上游流式返回的 `function_call` 会被转换成 OpenAI 形状的 `tool_calls`（chat）或 `function_call` item（responses）；非流式与 SSE 流式、`tool_choice` 的 `auto`/`none`/`required`/指定函数、`parallel_tool_calls` 都支持。
-- ⚠️ **桥不执行工具**：它只负责"把模型的调用请求交给客户端、再把客户端的结果带回去"。真正读写文件、跑命令的是你的客户端；historically 这一点最容易误解，所以单独写出来。
-- ⚠️ **只支持 `type: "function"` 工具**：其它工具类型（包括混合工具列表里的非函数工具）明确拒绝，不再静默丢弃。
-- ⚠️ **输出上限不支持**：默认兼容模式接受这些参数但通过 `X-Bridge-Compatibility-Warnings` 告知未兑现；`BRIDGE_STRICT_COMPATIBILITY=true` 时拒绝。不会截断字符来冒充 token 预算。
+- ✅ **Text Q&A**: single-turn, multi-turn, and SSE streaming are available; supports `reasoning_effort` and the legacy Completions shape. JSON output formats are guided through instructions; strict server-side schema compliance is not guaranteed.
+- ✅ **Function tool calling**: `tools` / legacy `functions` are forwarded upstream, and streamed upstream `function_call` results are converted to OpenAI-shaped `tool_calls` (chat) or `function_call` items (responses). Non-streaming and SSE streaming, `tool_choice` values `auto`/`none`/`required`/a specific function, and `parallel_tool_calls` are all supported.
+- ⚠️ **The bridge does not execute tools**: it only “passes the model's call requests to the client, then carries the client's results back.” Your client is what actually reads/writes files and runs commands. Historically, this has been the most easily misunderstood point, so it is stated separately here.
+- ⚠️ **Only `type: "function"` tools are supported**: other tool types (including non-function tools in mixed tool lists) are explicitly rejected, no longer silently discarded.
+- ⚠️ **Output limits are not supported**: default compatibility mode accepts these parameters but reports that they are not honored through `X-Bridge-Compatibility-Warnings`; `BRIDGE_STRICT_COMPATIBILITY=true` rejects them. The bridge does not truncate characters to pretend it has enforced a token budget.
 
-验证方式（2026-09-10 实测，都是打真实上游）：
+Verification (tested on 2026-09-10, all against real upstream services):
 
-| 场景 | 结果 |
+| Scenario | Result |
 |---|---|
-| 非流式 chat + `tools` | `finish_reason: "tool_calls"`，`tool_calls[0].function = {"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}`，`content: null` |
-| 流式 chat | 先发 `{"index":0,"id":"call_…","type":"function","function":{"name":…,"arguments":""}}`，再发参数增量分片，最后 `finish_reason: "tool_calls"` |
-| 并行调用 | 两个工具各返回一条独立 `tool_calls`，`index` 分别为 0/1 |
-| 回填闭环 | 回放 `tool_calls` + `role:"tool"` 结果后，模型给出 `It's currently 18°C and sunny in Paris.` |
-| `/v1/responses` | 非流式输出 `function_call` item（`call_id`/`name`/`arguments`），流式透传 `response.function_call_arguments.delta` 等事件 |
-| `strict: true` 工具 schema | 合规示例上游接受；不合规示例上游拒绝。桥原样保留 `strict` 与 schema，不自动降级，也不承诺所有 schema 均可用 |
+| Non-streaming chat + `tools` | `finish_reason: "tool_calls"`, `tool_calls[0].function = {"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}`, `content: null` |
+| Streaming chat | First sends `{"index":0,"id":"call_…","type":"function","function":{"name":…,"arguments":""}}`, then argument delta chunks, and finally `finish_reason: "tool_calls"` |
+| Parallel calls | Each of two tools returns a separate `tool_calls` entry, with `index` 0/1 respectively |
+| Result round trip | After replaying `tool_calls` + `role:"tool"` results, the model responds with `It's currently 18°C and sunny in Paris.` |
+| `/v1/responses` | Non-streaming output contains `function_call` items (`call_id`/`name`/`arguments`); streaming passes through events such as `response.function_call_arguments.delta` |
+| `strict: true` tool schema | Upstream accepted a compliant example and rejected a noncompliant example. The bridge preserves `strict` and the schema as-is, does not automatically downgrade them, and does not promise that every schema will work |
 
-`/health` 只返回最小健康状态、启动时间和部署 commit，不再触发外网能力探测；详细能力展示在首页（配置密钥后需要鉴权）。函数调用能力标识只表示桥的协议支持，不宣称所有上游模型均实测可用。
+`/health` returns only minimal health status, startup time, and deployment commit, and no longer triggers external capability discovery. Detailed capabilities are displayed on the homepage (authentication is required when a key is configured). The function-calling capability indicator denotes only the bridge's protocol support; it does not claim that every upstream model has been tested successfully.
 
-### 文本接口
+### Text Endpoints
 
-- `/v1/chat/completions`：支持普通响应和 SSE 流式响应；`messages[].content` 支持字符串，也支持常见 text / image content parts
-- `/v1/responses`：支持非流式和 SSE 流式；非流式会返回 `output_text`、`output` 和 `usage`
-- `/v1/completions`：兼容旧 Completions 形状，会映射成一次 Chat/Responses 文本调用
-- `reasoning_effort` 和 `reasoning.effort` 支持 `low` / `medium` / `high` / `xhigh`，也兼容 `extra high`
-- `response_format={"type":"json_object"}` 和常见 `json_schema` 会被转换成额外 instructions，引导上游返回纯 JSON
-- `/v1/responses` 的 `text.format.type=json_schema` 会被转换成额外 instructions，引导上游返回符合 schema 的纯 JSON
-- 多轮对话的 content part 会按角色重新定型：assistant 轮次只发 `output_text` / `refusal`，user 轮次只发 `input_text` / `input_image`。上游对 assistant 轮次收到 `input_text` 会整包报 `Invalid value: 'input_text'`，所以 `/v1/responses` 的 `input` 里客户端自己传的 message item 也会做同样归一化（其他 item 类型原样透传）
-- 工具历史严格配对：assistant `tool_calls` → `function_call`，tool 结果 → `function_call_output`。缺失 ID、孤儿结果或重复结果在请求校验阶段报错，不再降级为 user 文本。旧版 `function_call` / `role:"function"` 也按配对语义重放。
-- system/developer 文本提取到上游独立的 `instructions`，不作为 system 角色的 input item 发送（上游会拒绝），也不降级成 user；其他消息顺序及 Responses reasoning/item 元数据保留。
-- Responses 支持桥端内存存储和 `previous_response_id` 续链，包括仅提交 `function_call_output`：合并存储历史后检查配对。未知 previous ID 返回 404，错误配对返回 400，流式请求也会在 SSE 响应头发送前预检。生成前保存历史快照，避免生成期间旧记录删除/过期导致新记录丢失历史。
-- Responses 存储不跨重启、不跨进程共享；Chat Completions 的 `store:true` 仍不支持，会按兼容模式告警或严格模式拒绝。
-- 错误响应统一成 OpenAI 风格的 `{ "error": { "message", "type", "param", "code" } }`
+- `/v1/chat/completions`: supports regular and SSE streaming responses; `messages[].content` accepts strings as well as common text / image content parts.
+- `/v1/responses`: supports non-streaming and SSE streaming; non-streaming returns `output_text`, `output`, and `usage`.
+- `/v1/completions`: supports the legacy Completions shape, mapping it to one Chat/Responses text call.
+- `reasoning_effort` and `reasoning.effort` support `low` / `medium` / `high` / `xhigh`, and also accept `extra high`.
+- `response_format={"type":"json_object"}` and common `json_schema` formats are converted into additional instructions to guide upstream to return pure JSON.
+- `/v1/responses` `text.format.type=json_schema` is converted into additional instructions to guide upstream to return pure JSON conforming to the schema.
+- Content parts in multi-turn conversations are retyped by role: assistant turns send only `output_text` / `refusal`, and user turns send only `input_text` / `input_image`. Upstream rejects the entire request with `Invalid value: 'input_text'` if an assistant turn receives `input_text`, so client-supplied message items in `/v1/responses` `input` receive the same normalization (other item types pass through unchanged).
+- Tool history is strictly paired: assistant `tool_calls` → `function_call`, tool results → `function_call_output`. Missing IDs, orphaned results, or duplicate results cause request-validation errors and are no longer downgraded to user text. Legacy `function_call` / `role:"function"` are also replayed with pairing semantics.
+- system/developer text is extracted into upstream's separate `instructions`, not sent as system-role input items (which upstream rejects), and not downgraded to user text. Other message ordering and Responses reasoning/item metadata are preserved.
+- Responses supports bridge-side in-memory storage and continuation through `previous_response_id`, including submissions containing only `function_call_output`: pairing is checked after stored history is merged. Unknown previous IDs return 404; invalid pairing returns 400. Streaming requests are also prechecked before SSE response headers are sent. A history snapshot is saved before generation to prevent new records from losing history if old records are deleted or expire during generation.
+- Responses storage does not survive restarts or share state across processes. Chat Completions `store:true` remains unsupported and produces a compatibility-mode warning or a strict-mode rejection.
+- Error responses are normalized to the OpenAI-style `{ "error": { "message", "type", "param", "code" } }`.
 
-尽量兼容但不能完全等价的地方：
+Areas where compatibility is attempted but full equivalence is not possible:
 
-- `tool_choice="required"`、指定函数、`parallel_tool_calls` 都已支持（见「能力边界」）；桥只转发调用、不执行工具，工具的真正执行方是客户端。`type` 不是 `function` 的工具（如 `web_search`）会被明确拒绝。
-- `n > 1`、`best_of`、`logprobs` 会返回明确错误。原因是上游 Codex responses 通道按 turn 返回单个回答，也不返回 token 级 logprobs。
-- `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` 不转发给上游：实测 Codex responses 通道对这四个参数一律返回 `400 Unsupported parameter`，因此兼容模式不转发并在响应头告警，严格模式返回校验错误。
-- Chat Completions 的音频输出 modality 不走这里；请用 `/v1/audio/speech`。音频输入、转写、翻译等端点如果需要完整 OpenAI 行为，请配置 `OPENAI_API_KEY` 走代理。
-- Assistants、Files、Batches、Vector Stores、Fine-tuning、Embeddings、Moderations 等未内置端点：有 `OPENAI_API_KEY` 时代理到官方 API；没有时返回 `501 unsupported_endpoint` 并说明 ChatGPT/Codex subscription auth 没有向桥接层暴露对应 REST 能力。
+- `tool_choice="required"`, specific functions, and `parallel_tool_calls` are all supported (see “Capability Boundaries”). The bridge only forwards calls, not executes tools; the client is the actual tool executor. Tools whose `type` is not `function` (such as `web_search`) are explicitly rejected.
+- `n > 1`, `best_of`, and `logprobs` return explicit errors. The upstream Codex responses channel returns one answer per turn and does not return token-level logprobs.
+- `max_tokens` / `max_completion_tokens` / `max_output_tokens` / `truncation` are not forwarded upstream: tests showed that the Codex responses channel returns `400 Unsupported parameter` for all four. Compatibility mode therefore omits them and warns in response headers; strict mode returns a validation error.
+- Chat Completions audio output modality is not handled here; use `/v1/audio/speech`. For full OpenAI behavior on audio input, transcription, translation, and similar endpoints, configure `OPENAI_API_KEY` to use proxying.
+- Endpoints without built-in support, such as Assistants, Files, Batches, Vector Stores, Fine-tuning, Embeddings, and Moderations: proxied to the official API when `OPENAI_API_KEY` is available; otherwise return `501 unsupported_endpoint`, explaining that ChatGPT/Codex subscription auth does not expose the corresponding REST capabilities to the bridge layer.
 
-`/v1/models` 不维护任何写死的主列表或兜底列表，读取顺序是：
+`/v1/models` maintains no hardcoded primary or fallback list. Its lookup order is:
 
 1. `CHATGPT_MODELS`
-2. 未过期的 `$CODEX_HOME/models_cache.json`（默认 `~/.codex`，按文件 mtime，60 秒）
-3. 缓存为空或过期时查询上游（`CHATGPT_MODELS_URL`）；按 URL/账号/凭据/真实 client version 隔离缓存并合并并发请求
-4. `CHATGPT_EXTRA_MODELS` 追加
+2. Unexpired `$CODEX_HOME/models_cache.json` (default `~/.codex`, based on file mtime, 60 seconds)
+3. Query upstream (`CHATGPT_MODELS_URL`) when the cache is empty or expired; caches are isolated by URL/account/credentials/actual client version, and concurrent requests are coalesced
+4. Append `CHATGPT_EXTRA_MODELS`
 
-如果以上都没有来源，`/v1/models` 返回空列表；首页的模型快照包含来源和失败原因。过期缓存不在刷新失败后冒充可用模型。显式环境配置是用户声明，不等于已调用验证。上游要求的 client_version 从 `CHATGPT_CLIENT_VERSION`、真实缓存或已安装的 `codex --version` 获取，不写死版本。
+If none of these provides a source, `/v1/models` returns an empty list; the homepage model snapshot includes sources and failure reasons. An expired cache is not presented as available models after a failed refresh. Explicit environment configuration is a user declaration, not evidence of verified calls. The upstream-required client_version comes from `CHATGPT_CLIENT_VERSION`, the actual cache, or an installed `codex --version`; the version is not hardcoded.
 
-默认测试模型仅能在实际发现集合中选择（配置不存在的模型不会被加入列表），读取顺序是：
+The default test model can only be chosen from the actual discovered set (configuring a nonexistent model does not add it to the list), in this order:
 
 1. `CHATGPT_DEFAULT_MODEL`
-2. `~/.codex/config.toml` 中的 `model`
-3. 当前模型列表第一个（列表为空时首页不预填模型）
+2. `model` in `~/.codex/config.toml`
+3. The first model in the current list (the homepage does not prefill a model when the list is empty)
 
-默认不带任何内置别名，别名完全由 `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES` 决定。
+There are no built-in aliases by default; aliases are determined entirely by `CHATGPT_MODEL_ALIASES` / `CHATGPT_EXTRA_MODEL_ALIASES`.
 
-### 媒体接口
+### Media Endpoints
 
-- `/v1/images/generations`：优先使用 ChatGPT/Codex backend 的 Responses `image_generation` 工具，返回 `b64_json`；如果没有 ChatGPT token 但有 `OPENAI_API_KEY`，会兜底代理到 OpenAI Image API
-- `/v1/audio/speech`：优先使用 ChatGPT/Codex bearer 直连 OpenAI realtime WebSocket，收集 `response.output_audio.delta` 后返回真实音频；如果没有 ChatGPT token 但有 `OPENAI_API_KEY`，会兜底代理到 OpenAI Speech API
-- ChatGPT realtime 输出原生是 24 kHz PCM；`wav` / `pcm` 可直接返回，`mp3` / `aac` / `flac` / `opus` 需要本机 `ffmpeg`
-- 如果缺少对应真实上游凭据，媒体接口会返回 `501`，不会返回假图片或假音频
-- 媒体接口的 `model` 是必填项，缺失或为空会返回 `400`；bridge 不会替你猜一个模型名。图片走 Codex 通道时，上游 Responses 模型按 `CHATGPT_MEDIA_MODEL` → `CHATGPT_DEFAULT_MODEL` → 请求里真实存在的 `model` → 探测到的默认模型解析，语音走 `CHATGPT_REALTIME_MODEL` → 请求里的 `model`
+- `/v1/images/generations`: prefers the ChatGPT/Codex backend's Responses `image_generation` tool and returns `b64_json`; if there is no ChatGPT token but `OPENAI_API_KEY` is available, falls back to proxying to the OpenAI Image API.
+- `/v1/audio/speech`: prefers connecting directly to the OpenAI realtime WebSocket with the ChatGPT/Codex bearer, collecting `response.output_audio.delta` and returning real audio; if there is no ChatGPT token but `OPENAI_API_KEY` is available, falls back to proxying to the OpenAI Speech API.
+- ChatGPT realtime natively outputs 24 kHz PCM; `wav` / `pcm` can be returned directly, while `mp3` / `aac` / `flac` / `opus` require local `ffmpeg`.
+- Without the corresponding real upstream credentials, media endpoints return `501`, not fake images or audio.
+- `model` is required for media endpoints; a missing or empty value returns `400`. The bridge does not guess a model name for you. When images use the Codex channel, the upstream Responses model resolves as `CHATGPT_MEDIA_MODEL` → `CHATGPT_DEFAULT_MODEL` → a genuinely existing `model` from the request → the discovered default model. Speech uses `CHATGPT_REALTIME_MODEL` → the request's `model`.
 
-媒体能力探测（为什么媒体模型不会出现在 `/v1/models` 里）：
+Media capability discovery (why media models do not appear in `/v1/models`):
 
-- Codex 的模型列表（本地缓存和上游 `/backend-api/codex/models`）**只包含文本模型**，原始响应里没有任何 `gpt-image-*` / `tts-*` / `gpt-realtime-*` 条目；`/backend-api/codex/image_generation/models`、`/v1/realtime/models` 等媒体列表路由全部 404，`api.openai.com/v1/models` 用 ChatGPT 登录态会被 403 拒绝。
-- 媒体在上游是**能力/工具**而不是模型：ChatGPT web 的 `/backend-api/models` 用 `enabled_tools` 里的 `image_gen_tool_enabled` / `dalle_3` 标记哪些模型能用图片工具；realtime 语音只接受 `?model=` 参数，省略会直接 `missing_model`。
-- 图片能力通过首页的模型快照展示；探测失败或缺少证据时 `available:null/status:unknown`，只有明确工具列表没有图片标记时才是 unsupported。这些名称是工具宿主，不是图片生成器的模型身份。
-- Codex 图片响应的 `model` / `codex_model` 表示实际驱动模型，`requested_model` 保存客户端请求标签，`image_model:null` 明确底层生成器身份未披露，并附带说明。
+- The Codex model lists (local cache and upstream `/backend-api/codex/models`) **contain only text models**; the raw responses have no `gpt-image-*` / `tts-*` / `gpt-realtime-*` entries. Media-list routes such as `/backend-api/codex/image_generation/models` and `/v1/realtime/models` all return 404, and `api.openai.com/v1/models` rejects ChatGPT login credentials with 403.
+- Upstream treats media as **capabilities/tools**, not models: ChatGPT web's `/backend-api/models` uses `image_gen_tool_enabled` / `dalle_3` in `enabled_tools` to mark which models can use image tools. Realtime speech only accepts the `?model=` parameter; omitting it immediately yields `missing_model`.
+- Image capabilities are shown in the homepage model snapshot. Failed discovery or missing evidence yields `available:null/status:unknown`; only an explicit tool list without an image flag is treated as unsupported. These names identify tool hosts, not the image generator's model identity.
+- In Codex image responses, `model` / `codex_model` identify the actual driving model, `requested_model` preserves the client's requested label, and `image_model:null` explicitly indicates that the underlying generator's identity is undisclosed, with an accompanying explanation.
 
-## 请求示例
+## Request Examples
 
-示例里的 `<model-id>` 换成 `/v1/models` 返回的真实模型名；这个桥不会替你选模型。
+Replace `<model-id>` in the examples with an actual model name returned by `/v1/models`; this bridge does not choose a model for you.
 
-Chat Completions：
+Chat Completions:
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -340,7 +340,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Chat Completions 流式：
+Streaming Chat Completions:
 
 ```bash
 curl -N http://127.0.0.1:8000/v1/chat/completions \
@@ -353,7 +353,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Responses + JSON Schema：
+Responses + JSON Schema:
 
 ```bash
 curl http://127.0.0.1:8000/v1/responses \
@@ -377,7 +377,7 @@ curl http://127.0.0.1:8000/v1/responses \
   }'
 ```
 
-图片生成接口：
+Image generation endpoint:
 
 ```bash
 curl http://127.0.0.1:8000/v1/images/generations \
@@ -385,7 +385,7 @@ curl http://127.0.0.1:8000/v1/images/generations \
   -d '{"model":"<image-model>","prompt":"a bridge diagram","size":"1024x1024","quality":"auto","response_format":"b64_json"}'
 ```
 
-音频生成接口：
+Audio generation endpoint:
 
 ```bash
 curl http://127.0.0.1:8000/v1/audio/speech \
@@ -394,33 +394,33 @@ curl http://127.0.0.1:8000/v1/audio/speech \
   -d '{"model":"<speech-model>","input":"bridge audio test","voice":"marin","response_format":"wav"}'
 ```
 
-`<image-model>` / `<speech-model>` 必须按该账号真实可用能力配置；`/v1/models` 的 Codex 列表不提供独立图片/语音模型目录，不能据此保证媒体模型可用。图片的 Responses 驱动模型解析与底层生成器身份区别见「媒体接口」。
+`<image-model>` / `<speech-model>` must be configured according to capabilities actually available to the account. The Codex list in `/v1/models` does not provide a separate image/speech model directory and cannot guarantee media model availability. See “Media Endpoints” for the distinction between image Responses driving-model resolution and the underlying generator's identity.
 
-## 调试接口
+## Debugging Endpoints
 
-- `/`：首页和测试表单
-- `/health`：仅服务状态、服务名、部署 commit 和启动时间，不查询外网或返回模型/账号信息
-- `/routes`：可用路由
-- `/models` / `/v1/models`：模型列表
-- `/v1`：API 索引和推荐的 `agent_base_urls`
+- `/`: homepage and test forms
+- `/health`: only service status, service name, deployment commit, and startup time; does not query external services or return model/account information
+- `/routes`: available routes
+- `/models` / `/v1/models`: model list
+- `/v1`: API index and recommended `agent_base_urls`
 
-首页内置：
+The homepage includes:
 
-- 可切换的 `chat/completions`、`responses`、`images/generations`、`audio/speech` 测试表单
-- Chat Completions 流式响应测试
-- reasoning effort 选择（`low` / `medium` / `high` / `extra high`）
-- Responses JSON Schema 测试输入
-- 图片和音频响应预览
+- Switchable test forms for `chat/completions`, `responses`, `images/generations`, and `audio/speech`
+- Chat Completions streaming response tests
+- Reasoning effort selection (`low` / `medium` / `high` / `extra high`)
+- Responses JSON Schema test input
+- Image and audio response previews
 
-## Docker 说明
+## Docker Notes
 
-当前仓库内的 `Dockerfile` 适合做轻量启动，但它不会额外安装 Playwright 浏览器。
+The repository's current `Dockerfile` is suitable for lightweight startup, but does not additionally install a Playwright browser.
 
-这对云主机场景通常不是问题，因为 device-code 已经改成纯 HTTP，不再依赖浏览器自动化。  
-如果你明确要在容器里使用浏览器登录，则还需要额外补齐 Chromium 及系统依赖。
+This is generally not a problem for cloud servers, because device-code now uses pure HTTP and no longer depends on browser automation.
+If you specifically need browser login inside a container, you must additionally install Chromium and its system dependencies.
 
-## 注意事项
+## Important Notes
 
-- 本项目仅用于技术研究，请遵守 OpenAI 的服务条款
-- 由于依赖 ChatGPT Web / Codex 的上游行为，后续接口字段和认证流程可能变化
-- 高频调用可能触发风控或临时失败
+- This project is for technical research only; please comply with OpenAI's terms of service.
+- Because it depends on upstream ChatGPT Web / Codex behavior, API fields and authentication flows may change in the future.
+- High-frequency calls may trigger risk controls or temporary failures.
