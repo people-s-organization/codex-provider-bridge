@@ -697,8 +697,13 @@ class ChatGPTBridge:
             "instructions": instructions,
         }
         payload.update(tool_payload)
-        if request.reasoning and request.reasoning.effort:
-            payload["reasoning"] = {"effort": request.reasoning.effort}
+        # Prefer the native Responses field; accept the Chat-style alias as fallback.
+        reasoning_effort = (
+            request.reasoning.effort if request.reasoning and request.reasoning.effort
+            else request.reasoning_effort
+        )
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": reasoning_effort}
         # max_output_tokens is rejected upstream ("Unsupported parameter"), so the
         # request's limit is deliberately dropped here.
         return payload

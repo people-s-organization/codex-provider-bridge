@@ -392,6 +392,14 @@ class ResponsesRequest(GenerationRequest):
     instructions: Optional[str] = None
     text: Optional[Dict[str, Any]] = None
     reasoning: Optional[ReasoningConfig] = None
+    # Compatibility alias for clients sharing Chat Completions settings.
+    reasoning_effort: Optional[str] = None
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def validate_reasoning_effort(cls, value: Optional[str]) -> Optional[str]:
+        return normalize_reasoning_effort(value)
+
     max_output_tokens: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
     tools: Optional[List[Dict[str, Any]]] = None

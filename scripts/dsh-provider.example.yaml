@@ -1,0 +1,25 @@
+# Merge this section into your DSH settings; do not replace existing settings.
+# Replace the URL/port and model id with your bridge's actual values.
+# CODEX_BRIDGE_API_KEY is the bridge key, NOT the upstream ChatGPT token.
+llm-pi-ai:
+  providers:
+    codex-bridge:
+      displayName: Codex Bridge
+      api: openai-completions
+      baseURL: http://127.0.0.1:8790/v1
+      apiKeyEnv: CODEX_BRIDGE_API_KEY
+      reasoning: medium
+      compat:
+        thinkingFormat: openai
+        supportsReasoningEffort: true
+      models:
+        - id: REPLACE_WITH_MODEL_ID_FROM_BRIDGE
+          input: [text, image]
+          reasoningEfforts:
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+# Advertise only efforts/images supported by your chosen upstream model.
+# No off/none/minimal: the Codex bridge does not support those effort values.
+# To use Responses instead: api: openai-responses and REMOVE the compat block.

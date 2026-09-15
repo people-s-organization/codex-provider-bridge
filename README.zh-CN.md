@@ -201,6 +201,22 @@ http://<your-host>:<port>/v1
 
 在 DSH 的 provider 配置中使用 `api: openai-completions`，Base URL 指向本桥的 `/v1`（例如当前部署的 `http://127.0.0.1:8790/v1`；默认启动端口是 8000）。模型 ID 取自该桥实际返回的 `/v1/models`，API Key 按上面的桥鉴权配置填写。
 
+**思考强度与图片输入需要在 DSH 侧声明模型能力**，只填写 URL 和模型 ID 不够。可合并 [DSH 配置模板](scripts/dsh-provider.example.yaml) 到现有 settings 的 `llm-pi-ai.providers`（不要覆盖其他配置）：
+
+- `models[].input: [text, image]` 启用图片输入；未声明的手工模型默认只支持文本。
+- `models[].reasoningEfforts: {low: low, medium: medium, high: high, xhigh: xhigh}` 声明可选档位；`reasoning: medium` 设置 provider 默认档位。只列出上游模型实际支持的档位。
+- Chat 接口使用 `api: openai-completions`，建议显式设置 `compat: {thinkingFormat: openai, supportsReasoningEffort: true}`。DSH 实际发出 `reasoning_effort`，图片发出 `image_url` 的 Base64 data URL。
+- Responses 接口可使用 `api: openai-responses`，此时删除上述 Chat 专用 `compat` 配置；DSH 发出 `reasoning.effort` 和原生 `input_image`。bridge 也兼容顶层 `reasoning_effort` 别名，两个字段同时存在时优先使用原生 `reasoning.effort`。
+- 不要声明 `off: none`、`minimal` 等 bridge 不支持的档位。省略 effort 只代表采用上游默认值，不等于关闭思考。
+- `baseURL` 大小写必须准确，且以 `/v1` 结尾；`apiKeyEnv` 指向 bridge 密钥的环境变量/凭据引用，不是上游 ChatGPT token。未启用桥鉴权时可使用占位 key。
+- 该配置针对图片理解，不表示支持音频/视频输入；思考强度生效也不等于 Chat 接口会返回完整思考过程。
+
+离线验证安装的 DSH SDK 实际序列化（不访问 bridge 或上游）：
+
+```bash
+DSH_RUNTIME=/path/to/dsh-runtime node scripts/dsh_multimodal_probe.mjs
+```
+
 DSH 的 bash、read、web_search 等是客户端执行的 function 工具；桥不需要按工具名字逐个实现。DSH 的名为 `web_search` 的函数与 provider 原生的 `type: web_search` 不是一回事：前者可以转发，后者不是当前支持的工具类型。
 
 可复验脚本（服务须已运行；端口不同请调整参数/环境变量）：
