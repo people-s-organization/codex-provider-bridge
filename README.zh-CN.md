@@ -207,7 +207,9 @@ http://<your-host>:<port>/v1
 - `models[].reasoningEfforts: {low: low, medium: medium, high: high, xhigh: xhigh}` 声明可选档位；`reasoning: medium` 设置 provider 默认档位。只列出上游模型实际支持的档位。
 - Chat 接口使用 `api: openai-completions`，建议显式设置 `compat: {thinkingFormat: openai, supportsReasoningEffort: true}`。DSH 实际发出 `reasoning_effort`，图片发出 `image_url` 的 Base64 data URL。
 - Responses 接口可使用 `api: openai-responses`，此时删除上述 Chat 专用 `compat` 配置；DSH 发出 `reasoning.effort` 和原生 `input_image`。bridge 也兼容顶层 `reasoning_effort` 别名，两个字段同时存在时优先使用原生 `reasoning.effort`。
-- 不要声明 `off: none`、`minimal` 等 bridge 不支持的档位。省略 effort 只代表采用上游默认值，不等于关闭思考。
+- bridge 不再使用固定四档白名单：`none`、`minimal`、`ultra`、`max` 以及其他模型特有字符串均可透传，由上游校验实际支持情况。保留 `extra high` → `xhigh` 等旧别名；其他值仅去除首尾空白，不降档、不改写。
+- 如果模型的真实请求值为 `ultra`，可在该模型的 `reasoningEfforts` 增加 `max: ultra`：DSH 界面选择 **max**（或 provider 设置 `reasoning: max`），实际发送 **ultra**。当前 DSH 没有独立 `ultra` 选项键，不要直接添加 `ultra: ultra`。此映射不是对所有 GPT 模型能力的保证。
+- 支持关闭推理的模型可声明 `off: none`，支持 minimal 的模型可声明 `minimal: minimal`。省略 effort 只代表采用上游默认值，不等于关闭思考。
 - `baseURL` 大小写必须准确，且以 `/v1` 结尾；`apiKeyEnv` 指向 bridge 密钥的环境变量/凭据引用，不是上游 ChatGPT token。未启用桥鉴权时可使用占位 key。
 - 该配置针对图片理解，不表示支持音频/视频输入；思考强度生效也不等于 Chat 接口会返回完整思考过程。
 
@@ -290,7 +292,7 @@ DSH_RUNTIME=/path/to/dsh-runtime BRIDGE_BASE_URL=http://127.0.0.1:8790/v1 node s
 - `/v1/chat/completions`：支持普通响应和 SSE 流式响应；`messages[].content` 支持字符串，也支持常见 text / image content parts
 - `/v1/responses`：支持非流式和 SSE 流式；非流式会返回 `output_text`、`output` 和 `usage`
 - `/v1/completions`：兼容旧 Completions 形状，会映射成一次 Chat/Responses 文本调用
-- `reasoning_effort` 和 `reasoning.effort` 支持 `low` / `medium` / `high` / `xhigh`，也兼容 `extra high`
+- `reasoning_effort` 和 `reasoning.effort` 支持模型特有字符串透传（如 `ultra`），由上游校验档位；也保留 `extra high` → `xhigh` 兼容别名
 - `response_format={"type":"json_object"}` 和常见 `json_schema` 会被转换成额外 instructions，引导上游返回纯 JSON
 - `/v1/responses` 的 `text.format.type=json_schema` 会被转换成额外 instructions，引导上游返回符合 schema 的纯 JSON
 - 多轮对话的 content part 会按角色重新定型：assistant 轮次只发 `output_text` / `refusal`，user 轮次只发 `input_text` / `input_image`。上游对 assistant 轮次收到 `input_text` 会整包报 `Invalid value: 'input_text'`，所以 `/v1/responses` 的 `input` 里客户端自己传的 message item 也会做同样归一化（其他 item 类型原样透传）
@@ -424,7 +426,7 @@ curl http://127.0.0.1:8000/v1/audio/speech \
 
 - 可切换的 `chat/completions`、`responses`、`images/generations`、`audio/speech` 测试表单
 - Chat Completions 流式响应测试
-- reasoning effort 选择（`low` / `medium` / `high` / `extra high`）
+- reasoning effort 选择（含 `none` / `minimal` / `low` / `medium` / `high` / `extra high` / `ultra` / `max` 示例，实际可用档位取决于模型）
 - Responses JSON Schema 测试输入
 - 图片和音频响应预览
 

@@ -23,11 +23,12 @@ globalThis.fetch = async () => { throw new Error('Real network access forbidden 
 try {
   for (const api of ['openai-completions', 'openai-responses']) {
     const { stream } = await import(pathToFileURL(resolve(sdk, `${api}.js`)).href);
-    for (const effort of ['high', 'xhigh']) {
+    for (const effort of ['high', 'xhigh', 'max']) {
+      const wireEffort = effort === 'max' ? 'ultra' : effort;
       const model = {
         id: 'offline-probe-model', name: 'Offline Probe', api, provider: 'codex-bridge',
         baseUrl: 'http://offline.invalid/v1', reasoning: true,
-        thinkingLevelMap: { high: 'high', xhigh: 'xhigh' }, input: ['text', 'image'],
+        thinkingLevelMap: { high: 'high', xhigh: 'xhigh', max: 'ultra' }, input: ['text', 'image'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 262144, maxTokens: 32768,
         compat: api === 'openai-completions'
@@ -52,12 +53,12 @@ try {
       let image;
       if (api === 'openai-completions') {
         assert.equal(captured.url, 'http://offline.invalid/v1/chat/completions');
-        assert.equal(captured.body.reasoning_effort, effort);
+        assert.equal(captured.body.reasoning_effort, wireEffort);
         image = captured.body.messages.find(m => m.role === 'user').content.find(c => c.type === 'image_url');
         assert.equal(image.image_url.url, imageUrl);
       } else {
         assert.equal(captured.url, 'http://offline.invalid/v1/responses');
-        assert.deepEqual(captured.body.reasoning, { effort, summary: 'auto' });
+        assert.deepEqual(captured.body.reasoning, { effort: wireEffort, summary: 'auto' });
         assert.deepEqual(captured.body.include, ['reasoning.encrypted_content']);
         image = captured.body.input.find(m => m.role === 'user').content.find(c => c.type === 'input_image');
         assert.equal(image.image_url, imageUrl);

@@ -919,6 +919,11 @@ async def home(request: Request):
                 <div id="reasoning-field">
                   <label for="reasoning-effort">Reasoning Effort</label>
                   <select id="reasoning-effort" name="reasoning_effort">
+                    <option value="">upstream default</option>
+                    <option value="none">none</option>
+                    <option value="minimal">minimal</option>
+                    <option value="ultra">ultra (model-dependent)</option>
+                    <option value="max">max (model-dependent)</option>
                     <option value="low">low</option>
                     <option value="medium" selected>medium</option>
                     <option value="high">high</option>
@@ -1459,7 +1464,8 @@ async def api_index(request: Request):
         "service": app.title,
         "base_url": "/v1",
         "agent_base_urls": resolve_agent_base_urls(request),
-        "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+        "reasoning_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"],
+        "reasoning_effort_policy": "passthrough; examples only, actual support is model-dependent",
         "listen": {
             "host": ACTIVE_HOST,
             "port": resolve_request_port(request),

@@ -189,16 +189,14 @@ def normalize_reasoning_effort(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
 
-    normalized = value.strip().lower()
-    if not normalized:
+    effort = value.strip()
+    if not effort:
         return None
 
-    normalized = " ".join(normalized.replace("_", " ").replace("-", " ").split())
-    canonical = REASONING_EFFORT_ALIASES.get(normalized)
-    if canonical:
-        return canonical
-
-    raise ValueError("reasoning_effort must be one of: low, medium, high, xhigh (extra high)")
+    # Keep legacy spellings, but never constrain model-specific upstream values
+    # to a bridge-owned enum or silently downgrade them (e.g. ultra -> xhigh).
+    alias = " ".join(effort.lower().replace("_", " ").replace("-", " ").split())
+    return REASONING_EFFORT_ALIASES.get(alias, effort)
 
 class OpenAICompatModel(BaseModel):
     model_config = ConfigDict(extra="allow")

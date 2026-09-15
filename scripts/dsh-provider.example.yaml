@@ -21,5 +21,12 @@ llm-pi-ai:
             high: high
             xhigh: xhigh
 # Advertise only efforts/images supported by your chosen upstream model.
-# No off/none/minimal: the Codex bridge does not support those effort values.
+# Model-dependent additions under reasoningEfforts (uncomment only if supported):
+#             off: none
+#             minimal: minimal
+#             max: ultra
+# DSH displays `max`; the SDK sends literal `ultra`. This is not xhigh.
+# Select max in DSH (or set provider reasoning: max) to send ultra.
+# The bridge accepts custom strings; the upstream model validates actual support.
+# Omitted effort uses the upstream default; omission does not mean reasoning off.
 # To use Responses instead: api: openai-responses and REMOVE the compat block.
